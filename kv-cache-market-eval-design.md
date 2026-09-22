@@ -252,3 +252,63 @@ graph TD
 
 - §3의 "데이터센터·클라우드 서빙 기준선"은 도메인·종합 평가가 참조하는 전제이므로, 해당 담당자와 공유한 뒤 확정한다(협업 규칙 2).
 - "2-레이어(Evaluation Rubric + Evidence Policy) + 항목 순회" 템플릿을 이해관계자·도메인 관점에 재사용하는 것은 타 담당자 파일 변경을 함의하므로, 본 브랜치에서는 제안으로만 둔다.
+
+### 7.6 LLM 설정 (GPT-5.6 Luna)
+
+- 모델 ID: `gpt-5.6-luna` (GPT-5.6 패밀리 중 최저비용·최고속)
+- 엔드포인트: 표준 OpenAI (`https://api.openai.com/v1`), 별도 게이트웨이 불필요
+- API: reasoning 모델은 **Responses API 권장**. `reasoning.effort=low`
+- 구조화 출력: `client.responses.parse(model=..., reasoning={"effort": "low"}, text_format=PydanticModel)` → `response.output_parsed`
+- 비용: E1~E4 × SW/HW = 최대 8회 호출이므로 시스템·루브릭 프롬프트는 **prompt caching**으로 재사용
+- 주의: `max_output_tokens`에는 reasoning 토큰도 포함되므로 여유를 두고, `status == "incomplete"`(reason=`max_output_tokens`)를 처리한다
+- `reasoning.effort` 지원값: `none, low, medium(default), high, xhigh, max`
+
+### 7.7 웹검색(Tavily) 설정 (제안)
+
+| 파라미터 | 제안값 | 근거 |
+| --- | --- | --- |
+| `search_depth` | 기본 `basic`, 재시도 시 `advanced` | basic 1크레딧, advanced 2크레딧. 약함 재검색 시 정밀도 상향 |
+| `max_results` | `5` (재시도 `8`) | 스니펫 과다 방지 + 근거 다양성 |
+| `chunks_per_source` | `3` | 소스당 최대 스니펫(≤500자) |
+| `topic` | 기본 `general`, E3는 `news` | 최신 채택·출시 동향 |
+| `include_published_date` | `true` | `references.as_of`로 사용 |
+| `filter_by_published_date` | `false` | 날짜 미상 소스는 버리지 않음 |
+| `time_range` | **미사용** | 기술이 모두 2024년 이후라 하드 필터가 핵심 원문을 배제할 수 있음 |
+| `include_answer` | `false` | 자체 LLM 근거 판정 → 중복 생성 비용 제거 |
+| `include_raw_content` | `false` | 페이로드·토큰 절감 |
+| `include_domains` + `include_domains_mode` | 권위 도메인 + `prefer` | 피어리뷰·공식 우대, 하드 제한 없음 |
+| `language` | `en` (필터 미적용) | 논문·시장 리포트 대부분 영문 |
+| `auto_parameters` | `false` | 재현성 위해 명시 제어 |
+| `include_usage` | `true` | 크레딧 사용량 추적 |
+
+**약함 재시도 에스컬레이션(최대 3회)**
+1. `basic`, 5건, `general`
+2. 쿼리 재구성 + `advanced`, 8건
+3. `advanced` + `topic=news`(E3) 또는 권위 도메인 `prefer`
+→ 3회 후에도 약함이면 `NOT_VERIFIED`
+
+### 7.8 환경 변수 목록
+
+`.env.example`에 추가한 키와 의미는 다음과 같다(실제 값은 `.env`에 두며 커밋하지 않는다).
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | (비밀) | OpenAI API 키 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 엔드포인트 |
+| `OPENAI_MODEL` | `gpt-5.6-luna` | 사용 모델 ID |
+| `OPENAI_REASONING_EFFORT` | `low` | reasoning effort |
+| `OPENAI_MAX_OUTPUT_TOKENS` | `25000` | 출력 토큰 상한(reasoning 포함) |
+| `TAVILY_API_KEY` | (비밀) | Tavily API 키 |
+| `TAVILY_SEARCH_DEPTH` | `basic` | 검색 정밀도/지연 트레이드오프 |
+| `TAVILY_MAX_RESULTS` | `5` | 결과 수 |
+| `TAVILY_CHUNKS_PER_SOURCE` | `3` | 소스당 스니펫 수 |
+| `TAVILY_TOPIC` | `general` | 검색 범주 |
+| `TAVILY_LANGUAGE` | `en` | 결과 언어 부스트 |
+| `TAVILY_INCLUDE_PUBLISHED_DATE` | `true` | 발행일 포함 |
+| `EVAL_AS_OF` | (비우면 실행일) | 평가 기준 시점 |
+
+### 7.9 평가 기준 시점 정책 (제안)
+
+- **평가 기준일**: `EVAL_AS_OF`(비우면 실행일)를 사용하며, 보고서에 1회 명시한다.
+- **개별 수치의 기준 시점**: 각 출처의 `published_date`를 `references.as_of`로 기록한다(규칙 7).
+- **하드 최신 필터 미사용**: 다루는 기술이 모두 2024년 이후이므로 `time_range`로 결과를 잘라내지 않는다. 대신 발행일을 표기해 재현성을 확보한다.
