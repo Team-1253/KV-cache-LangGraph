@@ -164,7 +164,7 @@ def test_confirm_on_first_attempt():
     deps, search, judge, scorer = make_deps([_result()], [4])
     out = run_market_evaluation(make_state(), deps)
 
-    sw_items = out["market_result"]["sw"]["items"]
+    sw_items = out["market_result"]["deepseek_v2_mla"]["items"]
     assert list(sw_items.keys()) == ["3-2-a", "3-2-b", "3-2-c", "3-2-d"]
     assert all(item["attempts"] == 1 for item in sw_items.values())
     assert all(item["confidence_tag"] == TAG_MEDIUM for item in sw_items.values())
@@ -177,7 +177,7 @@ def test_weak_retries_then_confirms():
     deps, search, judge, scorer = make_deps([_result()], [2, 2, 4])
     out = run_market_evaluation(make_state(), deps)
 
-    items = out["market_result"]["sw"]["items"]
+    items = out["market_result"]["deepseek_v2_mla"]["items"]
     assert all(item["attempts"] == MAX_ATTEMPTS for item in items.values())
     assert all(item["confidence_tag"] == TAG_MEDIUM for item in items.values())
     assert judge.total_calls == 8 * 3
@@ -187,7 +187,7 @@ def test_no_results_is_not_verified():
     deps, search, judge, scorer = make_deps([], [4])
     out = run_market_evaluation(make_state(), deps)
 
-    item = out["market_result"]["sw"]["items"]["3-2-a"]
+    item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
     assert item["attempts"] == MAX_ATTEMPTS
     assert item["confidence_tag"] == TAG_NOT_VERIFIED
     assert item["score"] == 1
@@ -199,7 +199,7 @@ def test_weak_kept_when_sources_exist():
     deps, search, judge, scorer = make_deps([_result()], [2])
     out = run_market_evaluation(make_state(), deps)
 
-    item = out["market_result"]["sw"]["items"]["3-2-a"]
+    item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
     assert item["attempts"] == MAX_ATTEMPTS
     assert item["confidence_tag"] == TAG_WEAK
     assert item["score"] == 3  # from fake scorer, not forced to 1
@@ -210,7 +210,7 @@ def test_total_score_formula():
     deps, *_ = make_deps([_result()], [4], rubric_score=4)
     out = run_market_evaluation(make_state(), deps)
     # sum(scores) / 20 * 100 = 16 / 20 * 100 = 80.0
-    assert out["market_result"]["sw"]["score"] == pytest.approx(80.0)
+    assert out["market_result"]["deepseek_v2_mla"]["score"] == pytest.approx(80.0)
 
 
 def test_search_escalates_on_retry():
@@ -246,22 +246,23 @@ def test_json_serializable():
     json.dumps(out)  # 예외 없이 직렬화되어야 한다
 
 
-def test_sw_and_hw_evaluated_separately():
+def test_technologies_evaluated_separately():
     deps, *_ = make_deps([_result()], [4])
     out = run_market_evaluation(make_state(), deps)
-    assert out["market_result"]["sw"]["technology"] == "DeepSeek-V2 MLA"
-    assert out["market_result"]["hw"]["technology"] == "ITME"
+    assert set(out["market_result"].keys()) == {"deepseek_v2_mla", "itme"}
+    assert out["market_result"]["deepseek_v2_mla"]["technology"] == "DeepSeek-V2 MLA"
+    assert out["market_result"]["itme"]["technology"] == "ITME"
 
 
 def test_consumes_techprofile_schema():
     deps, search, *_ = make_deps([_result()], [2, 2, 4])
     out = run_market_evaluation(make_state(), deps)
 
-    sw = out["market_result"]["sw"]
+    sw = out["market_result"]["deepseek_v2_mla"]
     assert sw["tech_id"] == "deepseek_v2_mla"
     assert sw["camp"] == "SW"
-    assert out["market_result"]["hw"]["tech_id"] == "itme"
-    assert out["market_result"]["hw"]["camp"] == "HW"
+    assert out["market_result"]["itme"]["tech_id"] == "itme"
+    assert out["market_result"]["itme"]["camp"] == "HW"
 
     joined = " ".join(call["query"] for call in search.calls)
     # TechProfile의 overview/measurements가 쿼리 시드로 사용되어야 한다.
@@ -295,4 +296,4 @@ def test_partial_search_failure_is_tolerated():
     scorer = FakeScorer(score=4)
     deps = MarketDeps(FlakySearch(), PerKeyJudge([4]), scorer)
     out = run_market_evaluation(make_state(), deps)
-    assert out["market_result"]["sw"]["items"]["3-2-a"]["confidence_tag"] == TAG_MEDIUM
+    assert out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]["confidence_tag"] == TAG_MEDIUM
