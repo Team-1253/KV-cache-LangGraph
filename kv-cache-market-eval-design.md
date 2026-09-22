@@ -235,19 +235,19 @@ graph TD
 | `as_of` | 기준 시점 |
 | `url` | 접근 URL (있을 경우) |
 
-### 7.3 규칙 7 보강 (제안)
+### 7.3 규칙 7 보강
 
-협업 규칙 7(수치에 출처·기준 시점·단위·baseline 기록)을 구조적으로 보장하기 위해, 항목별 `sources[]`에 더해 정량 근거를 `evidence[]`로 남기는 것을 제안한다.
+협업 규칙 7(수치에 출처·기준 시점·단위·baseline 기록)을 구조적으로 보장하기 위해, 항목별 `sources[]`에 더해 정량 근거를 `evidence[]`로 남긴다. 채점 LLM이 `EvidenceItem`(`result_index`·`value`·`unit`·`baseline`·`note`)으로 반환하고, 노드가 검색 결과와 매핑해 아래 형태로 저장한다.
 
 ```json
 {
   "evidence": [
-    {"source": "...", "as_of": "2024-05", "unit": "x", "baseline": "MHA", "value": 93.3}
+    {"source": "...", "url": "...", "as_of": "2024-05", "unit": "x", "baseline": "MHA", "value": "93.3"}
   ]
 }
 ```
 
-서술형 `rationale`에만 의존하면 기준 시점·단위·baseline이 누락되거나 검증이 어려워진다.
+서술형 `rationale`에만 의존하면 기준 시점·단위·baseline이 누락되거나 검증이 어려워진다. `references[].source_type`은 `peer_review / official / vendor / news / community / unknown` 6종으로 분류한다.
 
 ### 7.4 Evidence 1점과 NOT_VERIFIED 우선순위 (제안)
 
