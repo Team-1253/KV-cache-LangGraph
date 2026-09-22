@@ -22,6 +22,20 @@
 - 100점 환산 총점 = `sum(scores) / 20 * 100` (4개 항목 동일 비중).
 - 근거 신뢰도 태그는 총점에 합산하지 않고 확신 수준 표시용으로만 쓴다.
 
+## 기술 조사 산출물(TechProfile) 사용 규칙
+
+검색 쿼리와 근거 해석에는 입력 `technical_result`의 `TechProfile`을 활용한다.
+`technical_result`는 `tech_id`(`deepseek_v2_mla` | `itme`)를 키로 하며, 각 프로필은 `camp`(SW/HW),
+`title`, `overview`, `mechanism`, `scope`, `claims`, `measurements`, `limits_explicit`,
+`limits_implicit`, `evidence_level`, `retrieval`을 담는다.
+
+- **`claims`와 `measurements`를 섞지 않는다.** `claims`는 논문 요약 주장, `measurements`는 실험
+  측정치이며 baseline이 서로 다를 수 있다. 수치를 인용할 때는 `baseline`과 `condition`을 반드시 함께 쓴다.
+- **`limits_implicit`는 논문에 없는 역산 한계**이므로 `basis`를 함께 제시한다.
+- `limits_explicit`가 0건이면 "한계가 없다"가 아니라 "논문이 밝히지 않았다"로 해석한다.
+- 근거를 표기할 때 `source`의 `chunk_id`/`page`를 그대로 인용한다.
+- `3-2-b`(비용·성능 효과)는 `measurements`를 우선 근거로 삼는다.
+
 ## 근거 신뢰도 태그 (4단계)
 
 | 태그 | 판정 기준 |
@@ -81,6 +95,8 @@
 ```json
 {
   "technology": "DeepSeek-V2 MLA",
+  "tech_id": "deepseek_v2_mla",
+  "camp": "SW",
   "score": 62.5,
   "rationale": "종합 요약",
   "evidence": [

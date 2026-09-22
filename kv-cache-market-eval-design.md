@@ -198,14 +198,22 @@ graph TD
 
 현재 `agents/state.py`에서 시장 평가 노드가 선언한 출력 키는 `market_result` 하나다. 시장 평가 노드는 자신이 생성한 키만 반환한다는 협업 규칙(규칙 3)에 맞춰 다음 형태를 제안한다.
 
-- 입력: `technical_result` (기술 조사 산출물), `selected_technologies`
+- 입력: `technical_result`(기술 조사 산출물, `tech_id` → `TechProfile`), `selected_technologies`
+  - `technical_result`는 `tech_id`(`deepseek_v2_mla` \| `itme`)를 키로 하고 `camp`(SW/HW)·`title`·
+    `overview`·`mechanism`·`scope`·`claims`·`measurements`·`limits_explicit`·`limits_implicit`·
+    `evidence_level`·`retrieval`을 담는다(정의: `agents/TECHNICAL_RESULT_SCHEMA.md`).
+  - 시장 평가는 `camp`를 이용해 결과 키를 `sw`/`hw`로 정규화하고, `3-2-b`(비용·성능 효과)는
+    `measurements`를 우선 근거로 사용한다. `claims`(요약 주장)와 `measurements`(실험 측정치)는
+    섞지 않는다.
 - 출력:
-  - `market_result`: SW·HW를 담는 단일 dict
+  - `market_result`: 기술별 dict(키 `sw`/`hw`)
 
     ```python
     market_result = {
-        "sw": {"technology": "...", "market_eval": {...}},
-        "hw": {"technology": "...", "market_eval": {...}},
+        "sw": {"technology": "...", "tech_id": "deepseek_v2_mla", "camp": "SW",
+               "score": 62.5, "rationale": "...", "evidence": [...],
+               "items": {"3-2-a": {...}, "3-2-b": {...}, "3-2-c": {...}, "3-2-d": {...}}},
+        "hw": {...},
     }
     ```
 
