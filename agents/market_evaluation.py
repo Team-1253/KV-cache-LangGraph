@@ -245,11 +245,31 @@ def build_queries(
     ]
 
 
+_MARKET_DOMAINS = (
+    "statista.com",
+    "gartner.com",
+    "idc.com",
+    "grandviewresearch.com",
+    "marketsandmarkets.com",
+    "mordorintelligence.com",
+    "precedenceresearch.com",
+    "fortunebusinessinsights.com",
+    "researchandmarkets.com",
+    "deepseek.com",
+    "nvidia.com",
+    "github.com",
+)
+
+
 def _search_settings(criterion: dict, attempt: int) -> dict:
     topic = "news" if criterion.get("id") == "3-2-c" else "general"
     depth = "basic" if attempt <= 1 else "advanced"
     max_results = 5 if attempt <= 1 else 8
-    return {"topic": topic, "depth": depth, "max_results": max_results}
+    settings: dict = {"topic": topic, "depth": depth, "max_results": max_results}
+    if attempt >= 2:
+        settings["include_domains"] = list(_MARKET_DOMAINS)
+        settings["include_domains_mode"] = "prefer"
+    return settings
 
 
 def _dedupe_results(results: list[dict]) -> list[dict]:
@@ -691,21 +711,32 @@ def _tavily_client():
 
 
 def default_web_search(
-    query: str, *, topic: str = "general", depth: str = "basic", max_results: int = 5
+    query: str,
+    *,
+    topic: str = "general",
+    depth: str = "basic",
+    max_results: int = 5,
+    include_domains: list[str] | None = None,
+    include_domains_mode: str | None = None,
 ) -> list[dict]:
     client = _tavily_client()
-    response = client.search(
-        query=query,
-        topic=topic,
-        search_depth=depth,
-        max_results=max_results,
-        chunks_per_source=int(os.getenv("TAVILY_CHUNKS_PER_SOURCE", "3")),
-        include_published_date=_bool_env("TAVILY_INCLUDE_PUBLISHED_DATE", True),
-        include_answer=False,
-        include_raw_content=False,
-        include_usage=True,
-        timeout=_float_env("TAVILY_TIMEOUT_SECONDS", 60.0),
-    )
+    params: dict = {
+        "query": query,
+        "topic": topic,
+        "search_depth": depth,
+        "max_results": max_results,
+        "chunks_per_source": int(os.getenv("TAVILY_CHUNKS_PER_SOURCE", "3")),
+        "include_published_date": _bool_env("TAVILY_INCLUDE_PUBLISHED_DATE", True),
+        "include_answer": False,
+        "include_raw_content": False,
+        "include_usage": True,
+        "timeout": _float_env("TAVILY_TIMEOUT_SECONDS", 60.0),
+    }
+    if include_domains:
+        params["include_domains"] = include_domains
+        if include_domains_mode:
+            params["include_domains_mode"] = include_domains_mode
+    response = client.search(**params)
     return response.get("results", [])
 
 
