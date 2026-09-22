@@ -33,6 +33,8 @@ KV cache 최적화 기술(SW 압축 vs HW 메모리 접근)을 LangGraph 기반 
 
 ## 4. Evaluation Rubric (시장성 관점, E1~E4)
 
+> 아래 E1~E4는 룰브릭 JSON(`data/3-2_market_evaluation.json`)의 `3-2-a`~`3-2-d`에 대응한다. 구현·출력에서는 `3-2-a`~`3-2-d`를 사용한다.
+
 **배점 및 환산 규칙**
 - 4개 항목을 1~5점으로 평가하며 동일 비중으로 반영한다.
 - `100점 환산 총점 = 획득 점수 합계 ÷ 20 × 100`
@@ -140,18 +142,18 @@ KV cache 최적화 기술(SW 압축 vs HW 메모리 접근)을 LangGraph 기반 
 
 ## 6. 시장성 평가 에이전트 워크플로우
 
-기술 1건당 한 번 호출되며, E1~E4를 순회하면서 항목마다 "검색 → 근거 판정 → 종료 또는 재검색 → 루브릭 채점"을 반복한다.
+기술 1건당 한 번 호출되며, `3-2-a`~`3-2-d`를 순회하면서 항목마다 "검색 → 근거 판정 → 종료 또는 재검색 → 루브릭 채점"을 반복한다.
 
 ```mermaid
 graph TD
-    A[입력: 기술 1건 + 기술조사 산출물] --> B[E1~E4 항목 순회 시작]
+    A[입력: 기술 1건 + 기술조사 산출물] --> B[3-2-a~d 항목 순회 시작]
     B --> C[항목별 확인 근거 키워드로 쿼리 생성]
     C --> D[RAG 검색: Doc Pool 벡터검색 + 필요시 웹검색]
     D --> E[Evidence Policy 판정 1~5점]
     E -->|3점 이상| F[근거 확정]
     E -->|2점 이하 및 시도<3| C
     E -->|3회 시도 후 2점 이하| G[NOT_VERIFIED 확정]
-    F --> H[Evaluation Rubric 채점 E1~E4]
+    F --> H[Evaluation Rubric 채점 3-2-a~d]
     G --> H
     H --> I{모든 항목 완료?}
     I -->|아니오| B
@@ -162,7 +164,7 @@ graph TD
 ### 단계별 설명
 
 1. **입력**: 기술 조사 에이전트가 넘긴 개요·범위·한계 + 평가 범위 전제("데이터센터·클라우드 서빙 기준 시장")를 시스템 프롬프트에 고정 주입한다.
-2. **항목 순회**: E1(시장 규모·성장) → E2(비용·성능 효과) → E3(채택·상용화) → E4(생태계 지지) 순서로 처리한다. 항목마다 "주요 확인 근거" 키워드 목록을 검색 쿼리 시드로 사용한다.
+2. **항목 순회**: `3-2-a`(시장 규모·성장) → `3-2-b`(비용·성능 효과) → `3-2-c`(채택·상용화) → `3-2-d`(생태계 지지) 순서로 처리한다. 각 항목은 기술 alias + 항목별 영문 시장 키워드 + 룰브릭 `evidence` + TechProfile 용어를 시드로 쿼리를 만든다. 재시도(2회차 이상)는 `advanced` 정밀도와 시장분석 도메인 `prefer`를 적용한다.
 3. **RAG 검색**: Doc Pool에서 관련 청크를 우선 검색하고(기술 조사 에이전트와 임베딩 모델 공유), TAM·CAGR·채택 사례처럼 Pool에 없는 시장 데이터는 웹검색으로 보강한다.
 4. **Evidence Policy 판정 = 종료 조건**: 검색 결과를 Evidence Policy 표(5/4/3/2/1)로 채점한다.
    - 3점 이상 → 해당 항목 검색 종료, 근거 확정
@@ -267,7 +269,7 @@ graph TD
 - 엔드포인트: 표준 OpenAI (`https://api.openai.com/v1`), 별도 게이트웨이 불필요
 - API: reasoning 모델은 **Responses API 권장**. `reasoning.effort=low`
 - 구조화 출력: `client.responses.parse(model=..., reasoning={"effort": "low"}, text_format=PydanticModel)` → `response.output_parsed`
-- 비용: E1~E4 × SW/HW = 최대 8회 호출이므로 시스템·루브릭 프롬프트는 **prompt caching**으로 재사용
+- 비용: 4항목 × 기술 수 = 최대 8회 호출이므로 시스템·루브릭 프롬프트는 **prompt caching**으로 재사용
 - 주의: `max_output_tokens`에는 reasoning 토큰도 포함되므로 여유를 두고, `status == "incomplete"`(reason=`max_output_tokens`)를 처리한다
 - `reasoning.effort` 지원값: `none, low, medium(default), high, xhigh, max`
 
@@ -278,13 +280,13 @@ graph TD
 | `search_depth` | 기본 `basic`, 재시도 시 `advanced` | basic 1크레딧, advanced 2크레딧. 약함 재검색 시 정밀도 상향 |
 | `max_results` | `5` (재시도 `8`) | 스니펫 과다 방지 + 근거 다양성 |
 | `chunks_per_source` | `3` | 소스당 최대 스니펫(≤500자) |
-| `topic` | 기본 `general`, E3는 `news` | 최신 채택·출시 동향 |
+| `topic` | 기본 `general`, `3-2-c`는 `news` | 최신 채택·출시 동향 |
 | `include_published_date` | `true` | `references.as_of`로 사용 |
 | `filter_by_published_date` | `false` | 날짜 미상 소스는 버리지 않음 |
 | `time_range` | **미사용** | 기술이 모두 2024년 이후라 하드 필터가 핵심 원문을 배제할 수 있음 |
 | `include_answer` | `false` | 자체 LLM 근거 판정 → 중복 생성 비용 제거 |
 | `include_raw_content` | `false` | 페이로드·토큰 절감 |
-| `include_domains` + `include_domains_mode` | 권위 도메인 + `prefer` | 피어리뷰·공식 우대, 하드 제한 없음 |
+| `include_domains` + `include_domains_mode` | 재시도(2회차)부터 시장분석·공식 도메인 + `prefer` | statista·gartner·idc 등 분석기관과 공식 출처 우대, 하드 제한 없음 |
 | `language` | `en` (필터 미적용) | 논문·시장 리포트 대부분 영문 |
 | `auto_parameters` | `false` | 재현성 위해 명시 제어 |
 | `include_usage` | `true` | 크레딧 사용량 추적 |
@@ -292,7 +294,7 @@ graph TD
 **약함 재시도 에스컬레이션(최대 3회)**
 1. `basic`, 5건, `general`
 2. 쿼리 재구성 + `advanced`, 8건
-3. `advanced` + `topic=news`(E3) 또는 권위 도메인 `prefer`
+3. `advanced` + `topic=news`(`3-2-c`) 또는 권위 도메인 `prefer`
 → 3회 후에도 약함이면 `NOT_VERIFIED`
 
 ### 7.8 환경 변수 목록
