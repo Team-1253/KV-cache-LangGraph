@@ -73,3 +73,19 @@
 - D3는 원격 `feature/technical-research` 브랜치에 있으며, `technical_result`의
   `tech_id`·`TechProfile` 스키마를 정의한다.
 - D4(PDF)와 D8·D9(웹 문서)는 코드 저장소 외부 자료다.
+
+## 5. 리팩터링 이력 (LangGraph/LangChain 기본 기능 사용)
+
+아래 리팩터링으로 코드 위치(라인)가 이동했고, 일부 수동 구현이 기본 기능으로 대체되었다.
+
+| 커밋 요약 | 내용 | 관련 기본 기능 |
+| --- | --- | --- |
+| refactor: Tavily를 langchain_tavily 래퍼로 교체 | `default_web_search`가 `tavily.TavilyClient` 대신 `langchain_tavily.TavilySearchAPIWrapper.raw_results` 사용 | `langchain_tavily` (D9) |
+| refactor: RetryPolicy·error_handler 도입 | `search`/`score` 노드의 수동 try/except 제거, `RetryPolicy`+`error_handler`로 오류 재시도/폴백 | `langgraph.types.RetryPolicy`, `NodeError` |
+| refactor: ChatPromptTemplate 전환 | 판정·채점 프롬프트를 `ChatPromptTemplate` 체인으로 구성 | `langchain_core.prompts` |
+| refactor: Send 기반 map 파이프라인 | `(기술 × 항목)` fan-out을 `Send` + reducer(`_merge_items`, `operator.add`)로 취합, `assemble` 노드가 조립 | `langgraph.types.Send` |
+
+추가 환경 변수: `TAVILY_BASE_URL`(선택).
+
+> `2`절의 코드 위치는 리팩터링 이전 기준이며, 현재 구조는 함수명 기준으로 대조한다
+> (`build_pipeline_graph`, `build_item_graph`, `_dispatch_items`, `_item_node`, `_assemble_node`).

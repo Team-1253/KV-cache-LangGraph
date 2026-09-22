@@ -166,7 +166,7 @@ graph TD
 
 1. **입력**: 기술 조사 에이전트가 넘긴 개요·범위·한계 + 평가 범위 전제("데이터센터·클라우드 서빙 기준 시장")를 시스템 프롬프트에 고정 주입한다.
 2. **항목 순회**: `3-2-a`(시장 규모·성장) → `3-2-b`(비용·성능 효과) → `3-2-c`(채택·상용화) → `3-2-d`(생태계 지지) 순서로 처리한다. 각 항목은 기술 alias + 항목별 영문 시장 키워드 + 루브릭 `evidence` + TechProfile 용어를 시드로 쿼리를 만든다. 재시도(2회차 이상)는 `advanced` 정밀도와 시장분석 도메인 `prefer`를 적용한다.
-3. **RAG 검색**: Doc Pool에서 관련 청크를 우선 검색하고(기술 조사 에이전트와 임베딩 모델 공유), TAM·CAGR·채택 사례처럼 Pool에 없는 시장 데이터는 웹검색으로 보강한다.
+3. **웹검색**: 시장 데이터(TAM·CAGR·채택 사례 등)는 웹검색으로 수집한다(시장 평가는 Doc Pool RAG를 사용하지 않는다). 검색은 `langchain_tavily` 래퍼를 사용한다.
 4. **Evidence Policy 판정 = 종료 조건**: 검색 결과를 Evidence Policy 표(5/4/3/2/1)로 채점한다.
    - 3점 이상 → 해당 항목 검색 종료, 근거 확정
    - 2점 이하이고 시도 3회 미만 → 쿼리를 다르게 재구성해 재검색
@@ -174,20 +174,39 @@ graph TD
 5. **Evaluation Rubric 채점**: 확정된 근거(또는 NOT_VERIFIED)를 바탕으로 해당 항목의 1~5점 기준표에 맞춰 점수와 판단 근거 요약을 생성한다. NOT_VERIFIED·채점 불가면 0점 처리한다.
 6. **결과 저장**: 항목마다 `{item, score, evidence_score, confidence_tag, sources[], rationale}` 구조로 남긴다.
 7. **4항목 완료 후 조립**: 기술 1건의 총점(`획득 점수 합계÷20×100`)과 항목별 상세를 `market_eval` 객체로 묶는다.
-8. **State 저장**: SW·HW 기술을 앵커링 방지 목적으로 각각 독립 평가하되, 노드는 `app.py`에서 한 번만 호출되므로 내부에서 두 기술을 순회한다. 결과는 단일 키 `market_result = {"sw": {...}, "hw": {...}}`에 담아 평가 종합 에이전트가 나란히 비교할 수 있게 한다. (구체 형태는 §8 제안사항 참고)
+8. **State 저장**: SW·HW 기술을 앵커링 방지 목적으로 각각 독립 평가하되, 노드는 `app.py`에서 한 번만 호출되므로 내부에서 두 기술을 순회한다. 결과는 단일 키 `market_result`에 `tech_id`(예: `deepseek_v2_mla`, `itme`)를 키로 담아 평가 종합 에이전트가 나란히 비교할 수 있게 한다. (구체 형태는 §7 제안사항 참고)
+
+### 구현 아키텍처 (LangGraph)
+
+구현은 LangGraph 기본 기능을 사용한다.
+
+- **fan-out (Send map)**: `build_pipeline_graph`가 `(기술 × 항목)` 조합마다 `Send("item", ...)`로 `item` 노드를 병렬 실행하고, `items`(깊은 병합 reducer)·`references`(`operator.add`)로 취합한 뒤 `assemble` 노드가 `market_result`를 조립한다.
+- **항목 서브그래프**: `item` 노드 내부에서 `build_item_graph`(query→search→judge→score)가 상태 전이를 담당한다.
+- **오류 재시도**: `search`·`score` 노드에 `RetryPolicy`를, 최종 실패 시 `error_handler`(빈 결과/0점 폴백)를 적용한다. 약함 재검색 도메인 루프(`route_after_judge`)는 별개다.
+- **프롬프트**: `ChatPromptTemplate`(시스템 메시지 + 휴먼 템플릿)을 `with_structured_output`과 체인으로 연결한다.
+- **검색**: `langchain_tavily.TavilySearchAPIWrapper.raw_results`를 사용한다(도메인 prefer·chunks_per_source 등 파라미터 유지).
 
 ### 출력 스키마 예시
 
 ```json
 {
-  "technology": "DeepSeek-V2 (MLA)",
-  "market_eval": {
-    "E1": {"score": 4, "evidence_score": 5, "confidence_tag": "강함", "sources": ["..."], "rationale": "..."},
-    "E2": {"score": 3, "evidence_score": 2, "confidence_tag": "약함", "sources": ["..."], "rationale": "..."},
-    "E3": {"score": 4, "evidence_score": 4, "confidence_tag": "보통", "sources": ["..."], "rationale": "..."},
-    "E4": {"score": 0, "evidence_score": null, "confidence_tag": "NOT_VERIFIED", "sources": [], "rationale": "..."},
-    "total_100": 60
-  }
+  "market_result": {
+    "deepseek_v2_mla": {
+      "technology": "DeepSeek-V2 MLA",
+      "tech_id": "deepseek_v2_mla",
+      "camp": "SW",
+      "score": 60.0,
+      "rationale": "...",
+      "evidence": [],
+      "items": {
+        "3-2-a": {
+          "item": "3-2-a", "score": 4, "confidence_tag": "보통",
+          "rationale": "...", "sources": [], "evidence": [], "attempts": 1
+        }
+      }
+    }
+  },
+  "references": []
 }
 ```
 
