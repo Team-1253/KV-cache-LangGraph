@@ -47,3 +47,11 @@ def build_graph():
 if __name__ == "__main__":
     graph = build_graph()
     print(graph.get_graph().draw_mermaid())
+
+    result = graph.invoke({
+    "selected_technologies": {"sw": "DeepSeek-V2 MLA", "hw": "ITME"},
+    "target_domain": "데이터센터",
+    "references": [],
+    })
+    
+    print(result["final_report"])

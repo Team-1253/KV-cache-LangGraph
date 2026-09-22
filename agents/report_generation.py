@@ -324,18 +324,30 @@ def _pick(container: dict, tech: str, role: str) -> dict:
     return (container or {}).get(tech) or (container or {}).get(role) or {}
 
 
-def _evidence_of(row: dict) -> list:
+def _evidence_of(row: dict) -> list[str]:
     """평가 행에 달린 출처 id. 상류마다 이름과 위치가 달라 모두 흡수한다.
 
-      - evidence / evidence_ids     : 평면 리스트
-      - criteria[].evidence_ids     : 이해관계자 평가의 세부 항목별 중첩
+      - evidence / evidence_ids     : 출처 객체 또는 문자열 리스트
+      - criteria                   : 항목 dict 또는 항목 리스트
       - components[].evidence       : TRL 평가의 구성요소별 중첩
     """
     ids = list(row.get("evidence") or row.get("evidence_ids") or [])
-    for nested in (row.get("criteria") or []) + (row.get("components") or []):
+    criteria = row.get("criteria") or []
+    if isinstance(criteria, dict):
+        criteria = list(criteria.values())
+    for nested in criteria + (row.get("components") or []):
         value = nested.get("evidence_ids") or nested.get("evidence") or []
         ids += value if isinstance(value, list) else [value]
-    return ids
+    normalized = []
+    for evidence in ids:
+        if isinstance(evidence, dict):
+            evidence = (evidence.get("id") or evidence.get("evidence_id")
+                        or evidence.get("url") or evidence.get("source"))
+            if isinstance(evidence, dict):
+                evidence = evidence.get("chunk_id")
+        if isinstance(evidence, str) and evidence:
+            normalized.append(evidence)
+    return normalized
 
 
 def _kind_of(ref: dict) -> str:
