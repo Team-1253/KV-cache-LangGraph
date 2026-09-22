@@ -1,10 +1,522 @@
-"""시장 평가 Agent."""
+"""시장 평가 Agent.
+
+`data/3-2_market_evaluation.json` 룰브릭을 단일 소스로 사용한다. 기술(SW/HW) 1건마다
+항목(3-2-a ~ 3-2-d)을 순회하며 "쿼리 생성 → 웹검색 → 근거 판정 → (약함이면 재검색) →
+룰브릭 채점"을 수행한다. 바깥 그래프에는 단일 노드로 보이며, 항목별 상태 전이는 내부
+LangGraph 서브그래프가 담당한다.
+
+노드는 자신이 생성한 State Key(`market_result`, `references`)만 반환한다.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from datetime import date
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
 
 from agents.state import EvaluationState
 
+ROOT = Path(__file__).resolve().parent.parent
+RUBRIC_PATH = ROOT / "data" / "3-2_market_evaluation.json"
+PROMPT_PATH = ROOT / "prompts" / "market_evaluation.md"
+
+MAX_ATTEMPTS = 3
+CONFIRM_THRESHOLD = 3
+
+TAG_STRONG = "강함"
+TAG_MEDIUM = "보통"
+TAG_WEAK = "약함"
+TAG_NOT_VERIFIED = "NOT_VERIFIED"
+
+
+# --------------------------------------------------------------------------- #
+# Structured output schemas
+# --------------------------------------------------------------------------- #
+class EvidenceJudgement(BaseModel):
+    """검색 결과의 근거 품질 판정(검색 종료 조건)."""
+
+    evidence_score: int = Field(ge=0, le=5, description="근거 품질 0~5. 출처 없음은 0.")
+    reason: str = Field(description="판정 이유")
+
+
+class RubricScore(BaseModel):
+    """확정 근거에 대한 룰브릭 채점."""
+
+    score: int = Field(ge=1, le=5)
+    rationale: str = Field(description="판단 근거 요약")
+
+
+# --------------------------------------------------------------------------- #
+# Injectable dependencies
+# --------------------------------------------------------------------------- #
+@dataclass
+class MarketDeps:
+    web_search: Callable[..., list[dict]]
+    judge_evidence: Callable[..., EvidenceJudgement]
+    score_rubric: Callable[..., RubricScore]
+
+
+# --------------------------------------------------------------------------- #
+# Inner item state (state transitions inside the single node)
+# --------------------------------------------------------------------------- #
+class _ItemStateRequired(TypedDict):
+    criterion: dict[str, Any]
+    technology: str
+
+
+class ItemState(_ItemStateRequired, total=False):
+    tech_info: dict[str, Any]
+    attempt: int
+    queries: list[str]
+    results: list[dict]
+    evidence_score: int
+    judgement_reason: str
+    score: int
+    rationale: str
+    confidence_tag: str
+    sources: list[str]
+    evidence: list[dict]
+
+
+# --------------------------------------------------------------------------- #
+# Config / resources
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=1)
+def load_rubric(path: str = str(RUBRIC_PATH)) -> dict:
+    with open(path, encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+@lru_cache(maxsize=1)
+def load_system_prompt(path: str = str(PROMPT_PATH)) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _eval_as_of() -> str:
+    return os.getenv("EVAL_AS_OF") or date.today().isoformat()
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def map_tag(evidence_score: int) -> str:
+    """evidence_score(0~5)를 4단계 신뢰도 태그로 환산한다."""
+    if evidence_score >= 5:
+        return TAG_STRONG
+    if evidence_score >= CONFIRM_THRESHOLD:
+        return TAG_MEDIUM
+    if evidence_score >= 1:
+        return TAG_WEAK
+    return TAG_NOT_VERIFIED
+
+
+# --------------------------------------------------------------------------- #
+# Query building
+# --------------------------------------------------------------------------- #
+def _tech_terms(tech_info: dict) -> list[str]:
+    terms: list[str] = []
+    for key in ("summary", "performance", "limitations", "evidence"):
+        value = tech_info.get(key)
+        if isinstance(value, str):
+            terms.append(value)
+        elif isinstance(value, list):
+            terms.extend(str(item) for item in value)
+    return [term for term in terms if term]
+
+
+def build_queries(
+    criterion: dict, technology: str, tech_info: dict, attempt: int
+) -> list[str]:
+    """룰브릭의 evidence 목록과 기술 정보를 시드로 검색 쿼리를 만든다."""
+    question = criterion.get("question", "")
+    evidence = criterion.get("evidence", []) or []
+    seeds = " ".join(evidence)
+    if attempt <= 1:
+        return [f"{technology} {question} {seeds}", f"{technology} {seeds}"]
+    tech_terms = " ".join(_tech_terms(tech_info))
+    if attempt == 2:
+        return [
+            f"{technology} {question} {seeds} {tech_terms}".strip(),
+            f"{technology} {seeds} market adoption TCO",
+        ]
+    return [
+        f"{technology} {' '.join(evidence[:3])} market analysis",
+        f"{technology} market adoption ecosystem TCO trend",
+    ]
+
+
+def _search_settings(criterion: dict, attempt: int) -> dict:
+    topic = "news" if criterion.get("id") == "3-2-c" else "general"
+    depth = "basic" if attempt <= 1 else "advanced"
+    max_results = 5 if attempt <= 1 else 8
+    return {"topic": topic, "depth": depth, "max_results": max_results}
+
+
+def _dedupe_results(results: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for result in results:
+        key = str(result.get("url") or result.get("title") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(result)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Inner subgraph nodes
+# --------------------------------------------------------------------------- #
+def _query_node() -> Callable[[ItemState], dict]:
+    def node(state: ItemState) -> dict:
+        attempt = int(state.get("attempt", 0)) + 1
+        queries = build_queries(
+            state["criterion"], state["technology"], state.get("tech_info", {}), attempt
+        )
+        return {"attempt": attempt, "queries": queries, "results": []}
+
+    return node
+
+
+def _search_node(deps: MarketDeps) -> Callable[[ItemState], dict]:
+    def node(state: ItemState) -> dict:
+        settings = _search_settings(state["criterion"], int(state.get("attempt", 1)))
+        results: list[dict] = []
+        for query in state.get("queries", []):
+            try:
+                results.extend(deps.web_search(query, **settings) or [])
+            except Exception:  # noqa: BLE001 - 검색 실패는 빈 결과로 처리
+                continue
+        return {"results": _dedupe_results(results)}
+
+    return node
+
+
+def _judge_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], dict]:
+    def node(state: ItemState) -> dict:
+        results = state.get("results", [])
+        if not results:
+            return {"evidence_score": 0, "judgement_reason": "검색 결과 없음"}
+        judgement = deps.judge_evidence(
+            system_prompt, state["criterion"], state["technology"], results
+        )
+        return {
+            "evidence_score": int(judgement.evidence_score),
+            "judgement_reason": judgement.reason,
+        }
+
+    return node
+
+
+def route_after_judge(state: ItemState) -> str:
+    if int(state.get("evidence_score", 0)) >= CONFIRM_THRESHOLD:
+        return "score"
+    if int(state.get("attempt", 1)) >= MAX_ATTEMPTS:
+        return "score"
+    return "retry"
+
+
+def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], dict]:
+    def node(state: ItemState) -> dict:
+        evidence_score = int(state.get("evidence_score", 0))
+        results = state.get("results", [])
+        if evidence_score <= 0 or not results:
+            return {
+                "score": 1,
+                "rationale": state.get("judgement_reason", "근거를 확인하지 못함"),
+                "confidence_tag": TAG_NOT_VERIFIED,
+                "sources": [],
+                "evidence": [],
+            }
+        scored = deps.score_rubric(
+            system_prompt, state["criterion"], state["technology"], results, evidence_score
+        )
+        return {
+            "score": int(scored.score),
+            "rationale": scored.rationale,
+            "confidence_tag": map_tag(evidence_score),
+            "sources": _sources_from_results(results),
+            "evidence": _evidence_from_results(results),
+        }
+
+    return node
+
+
+def build_item_graph(deps: MarketDeps, system_prompt: str):
+    """항목 1건의 상태 전이를 담당하는 내부 서브그래프."""
+    graph = StateGraph(ItemState)
+    graph.add_node("query", _query_node())
+    graph.add_node("search", _search_node(deps))
+    graph.add_node("judge", _judge_node(system_prompt, deps))
+    graph.add_node("score", _score_node(system_prompt, deps))
+
+    graph.add_edge(START, "query")
+    graph.add_edge("query", "search")
+    graph.add_edge("search", "judge")
+    graph.add_conditional_edges(
+        "judge", route_after_judge, {"retry": "query", "score": "score"}
+    )
+    graph.add_edge("score", END)
+    return graph.compile()
+
+
+# --------------------------------------------------------------------------- #
+# Assembly helpers
+# --------------------------------------------------------------------------- #
+def _format_results(results: list[dict]) -> str:
+    blocks = []
+    for idx, result in enumerate(results, 1):
+        blocks.append(
+            "[{i}] {title} ({date})\n{url}\n{content}".format(
+                i=idx,
+                title=result.get("title", ""),
+                date=result.get("published_date") or "기준 시점 미상",
+                url=result.get("url", ""),
+                content=result.get("content", ""),
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def _sources_from_results(results: list[dict]) -> list[str]:
+    return [url for result in results if (url := result.get("url"))]
+
+
+def _evidence_from_results(results: list[dict]) -> list[dict]:
+    return [
+        {
+            "source": result.get("title", ""),
+            "url": result.get("url", ""),
+            "as_of": result.get("published_date") or "",
+            "unit": "",
+            "baseline": "",
+            "value": None,
+        }
+        for result in results
+    ]
+
+
+def _source_type(url: str) -> str:
+    host = url.lower()
+    if any(domain in host for domain in ("arxiv.org", "acm.org", "ieee.org", "usenix.org", "openreview.net")):
+        return "peer_review"
+    if any(domain in host for domain in ("github.com", "huggingface.co", "docs.")):
+        return "official"
+    if any(domain in host for domain in ("reddit.com", "news.ycombinator.com", "medium.com")):
+        return "community"
+    return "unknown"
+
+
+def _to_references(key: str, items: dict[str, dict]) -> list[dict]:
+    refs: list[dict] = []
+    for item_id, item in items.items():
+        for evidence in item.get("evidence", []):
+            url = evidence.get("url", "")
+            refs.append(
+                {
+                    "id": f"ref-{key}-{item_id}-{len(refs) + 1}",
+                    "technology": key,
+                    "item": item_id,
+                    "source": evidence.get("source", ""),
+                    "source_type": _source_type(url),
+                    "as_of": evidence.get("as_of", ""),
+                    "url": url,
+                }
+            )
+    return refs
+
+
+def _dedupe_references(references: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for reference in references:
+        key = reference.get("url") or reference.get("id", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(reference)
+    return out
+
+
+def _total_score(items: dict[str, dict], criteria: list[dict]) -> float:
+    denominator = len(criteria) * 5
+    if not denominator:
+        return 0.0
+    return round(sum(item.get("score", 1) for item in items.values()) / denominator * 100, 2)
+
+
+def _overall_rationale(technology: str, items: dict[str, dict]) -> str:
+    parts = [
+        f"{item_id}: {item.get('rationale', '').strip()}"
+        for item_id, item in items.items()
+        if item.get("rationale")
+    ]
+    return f"{technology} 시장성 종합 — " + " / ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
+    rubric = load_rubric()
+    system_prompt = load_system_prompt()
+    criteria = rubric.get("criteria", [])
+    technologies = state.get("selected_technologies", {}) or {}
+    technical_result = state.get("technical_result", {}) or {}
+    eval_as_of = _eval_as_of()
+
+    graph = build_item_graph(deps, system_prompt)
+
+    market_result: dict[str, dict] = {}
+    references: list[dict] = []
+
+    for key, technology in technologies.items():
+        tech_info = technical_result.get(key, {}) if isinstance(technical_result, dict) else {}
+        items: dict[str, dict] = {}
+        for criterion in criteria:
+            final = graph.invoke(
+                {
+                    "criterion": criterion,
+                    "technology": technology,
+                    "tech_info": tech_info,
+                    "attempt": 0,
+                }
+            )
+            items[criterion["id"]] = {
+                "item": criterion["id"],
+                "score": final.get("score", 1),
+                "confidence_tag": final.get("confidence_tag", TAG_NOT_VERIFIED),
+                "rationale": final.get("rationale", ""),
+                "sources": final.get("sources", []),
+                "evidence": final.get("evidence", []),
+                "attempts": final.get("attempt", 0),
+            }
+
+        market_result[key] = {
+            "technology": technology,
+            "score": _total_score(items, criteria),
+            "rationale": _overall_rationale(technology, items),
+            "evidence": [ev for item in items.values() for ev in item.get("evidence", [])],
+            "items": items,
+        }
+        references.extend(_to_references(key, items))
+
+    for reference in references:
+        if not reference.get("as_of"):
+            reference["as_of"] = eval_as_of
+
+    return {"market_result": market_result, "references": _dedupe_references(references)}
+
 
 def market_evaluation_agent(state: EvaluationState) -> dict:
-    """시장 규모, 경제성, 채택 현황과 생태계를 평가한다."""
+    """LangGraph 시장 평가 노드."""
+    return run_market_evaluation(state, default_deps())
 
-    # TODO: RAG/웹 검색과 4개 시장 평가 항목을 구현한다.
-    raise NotImplementedError
+
+# --------------------------------------------------------------------------- #
+# Default (real) dependencies — imported lazily so tests need no network/LLM
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=1)
+def _chat_model():
+    from langchain_openai import ChatOpenAI
+
+    kwargs: dict[str, Any] = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-5.6-luna"),
+        "reasoning_effort": os.getenv("OPENAI_REASONING_EFFORT", "low"),
+        "use_responses_api": True,
+        "temperature": 0,
+    }
+    if os.getenv("OPENAI_API_KEY"):
+        kwargs["api_key"] = os.getenv("OPENAI_API_KEY")
+    if os.getenv("OPENAI_BASE_URL"):
+        kwargs["base_url"] = os.getenv("OPENAI_BASE_URL")
+    max_output = os.getenv("OPENAI_MAX_OUTPUT_TOKENS")
+    if max_output:
+        kwargs["max_tokens"] = int(max_output)
+    return ChatOpenAI(**kwargs)
+
+
+@lru_cache(maxsize=1)
+def _tavily_client():
+    from tavily import TavilyClient
+
+    return TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+
+def default_web_search(
+    query: str, *, topic: str = "general", depth: str = "basic", max_results: int = 5
+) -> list[dict]:
+    client = _tavily_client()
+    response = client.search(
+        query=query,
+        topic=topic,
+        search_depth=depth,
+        max_results=max_results,
+        chunks_per_source=int(os.getenv("TAVILY_CHUNKS_PER_SOURCE", "3")),
+        include_published_date=_bool_env("TAVILY_INCLUDE_PUBLISHED_DATE", True),
+        include_answer=False,
+        include_raw_content=False,
+        include_usage=True,
+    )
+    return response.get("results", [])
+
+
+def default_judge_evidence(
+    system_prompt: str, criterion: dict, technology: str, results: list[dict]
+) -> EvidenceJudgement:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    model = _chat_model().with_structured_output(EvidenceJudgement)
+    user = (
+        f"기술: {technology}\n"
+        f"평가 항목: {criterion.get('id')} — {criterion.get('question')}\n"
+        f"확인 근거: {', '.join(criterion.get('evidence', []))}\n"
+        f"주의: {' '.join(criterion.get('cautions', []))}\n\n"
+        f"검색 결과:\n{_format_results(results)}\n\n"
+        "위 결과의 근거 품질을 0~5로 판정해 evidence_score와 reason을 반환하라."
+    )
+    return model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user)])
+
+
+def default_score_rubric(
+    system_prompt: str,
+    criterion: dict,
+    technology: str,
+    results: list[dict],
+    evidence_score: int,
+) -> RubricScore:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    score_table = "\n".join(
+        f"{level}: {desc}" for level, desc in criterion.get("scores", {}).items()
+    )
+    model = _chat_model().with_structured_output(RubricScore)
+    user = (
+        f"기술: {technology}\n"
+        f"평가 항목: {criterion.get('id')} — {criterion.get('question')}\n"
+        f"채점 기준:\n{score_table}\n"
+        f"주의: {' '.join(criterion.get('cautions', []))}\n"
+        f"근거 신뢰도 판정 점수: {evidence_score}\n\n"
+        f"확정된 검색 결과:\n{_format_results(results)}\n\n"
+        "위 근거에 따라 score(1~5)와 rationale을 반환하라."
+    )
+    return model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user)])
+
+
+def default_deps() -> MarketDeps:
+    return MarketDeps(
+        web_search=default_web_search,
+        judge_evidence=default_judge_evidence,
+        score_rubric=default_score_rubric,
+    )
