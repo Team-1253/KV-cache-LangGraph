@@ -634,7 +634,7 @@ if __name__ == "__main__":
                 "evidence_level": "limited",
                 "retrieval": {
                     "query_count": 5,
-                    "retrieved_chunk_count": 10,
+                    "retrieved_chunk_count": 15,
                     "used_chunk_count": 6,
                 },
             },
