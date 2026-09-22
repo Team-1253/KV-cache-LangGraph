@@ -70,6 +70,7 @@ ASPECT_QUERIES: list[str] = [
     "메모리 절감량 또는 용량 확장 수치",
     "한계점과 제약 조건",
     "성능이 저하되거나 불리해지는 조건",
+    "프로토타입 구현의 성능 격차와 최적화가 필요한 부분",
 ]
 
 
@@ -132,10 +133,16 @@ class _TrlComponent(BaseModel):
     evidence: str = Field(description="이 단계로 판정한 근거")
 
 
+class _TrlComponentCritical(_TrlComponent):
+    is_critical: bool = Field(
+        description="이 구성요소 없이는 기술이 성립하지 않는가. 핵심 경로면 true"
+    )
+
+
 class _TrlVerdict(BaseModel):
-    trl_lower: int = Field(description="확인된 증거로 보장되는 최저 단계")
-    trl_upper: int = Field(description="비공개 구간을 감안한 추정 최고 단계")
-    components: list[_TrlComponent] = Field(default_factory=list)
+    """구간은 LLM이 단언하지 않고 구성요소 판정에서 계산한다(재현성 확보)."""
+
+    components: list[_TrlComponentCritical] = Field(default_factory=list)
     rationale: str = Field(description="판정 요약. 공개 정보 기반 추정임을 명시할 것")
 
 
@@ -189,9 +196,33 @@ def _retrieve(retriever: TechRetriever, per_query_k: int = 4) -> list[Document]:
     return sorted(seen.values(), key=lambda d: (d.metadata["page"], d.metadata["chunk_id"]))
 
 
+# baseline/condition 을 형식상으로만 채운 값. 이 경우 수치를 인용할 수 없다.
+_PLACEHOLDER = {"", "-", "--", "n/a", "na", "none", "없음", "미상", "불명", "not specified", "unknown"}
+
+
+def _is_placeholder(value: str) -> bool:
+    return str(value).strip().lower() in _PLACEHOLDER
+
+
 def _drop_ungrounded(items: list, valid_ids: set[str]) -> tuple[list[dict], int]:
     """근거 chunk_id가 실제 검색 결과에 없는 항목을 버린다(환각 출처 차단)."""
     kept = [i for i in items if i.source.chunk_id in valid_ids]
+    return [i.model_dump() for i in kept], len(items) - len(kept)
+
+
+def _drop_unusable_measurements(items: list, valid_ids: set[str]) -> tuple[list[dict], int]:
+    """측정치는 baseline·condition 이 모두 실질적으로 채워져 있어야 인용 가능하다.
+
+    '무엇 대비'와 '어떤 조건'이 없는 수치는 보고서에서 오인용을 만든다.
+    (예: ITME abstract의 1.80×는 NVMe-oF 대비이고, §6.1의 1.81×는 재계산 대비다)
+    """
+    kept = [
+        i
+        for i in items
+        if i.source.chunk_id in valid_ids
+        and not _is_placeholder(i.baseline)
+        and not _is_placeholder(i.condition)
+    ]
     return [i.model_dump() for i in kept], len(items) - len(kept)
 
 
@@ -248,7 +279,7 @@ def technical_research_agent(state: EvaluationState) -> dict:
         mechanism, dropped["mechanism"] = _drop_ungrounded(ex.mechanism, valid_ids)
         scope, dropped["scope"] = _drop_ungrounded(ex.scope, valid_ids)
         claims, dropped["claims"] = _drop_ungrounded(ex.claims, valid_ids)
-        measurements, dropped["measurements"] = _drop_ungrounded(ex.measurements, valid_ids)
+        measurements, dropped["measurements"] = _drop_unusable_measurements(ex.measurements, valid_ids)
         limits_e, dropped["limits_explicit"] = _drop_ungrounded(ex.limits_explicit, valid_ids)
         limits_i, dropped["limits_implicit"] = _drop_ungrounded(im.limits_implicit, valid_ids)
 
@@ -336,10 +367,25 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
             ]
         )
 
-        lo, hi = sorted((max(1, min(9, verdict.trl_lower)), max(1, min(9, verdict.trl_upper))))
+        # 시스템 전체의 성숙도는 '가장 덜 성숙한 핵심 구성요소'에 묶인다.
+        #   하한 = 핵심 구성요소 중 최저 단계 (이 단계를 넘었다고 보장할 수 없다)
+        #   상한 = 전체 구성요소 중 최고 단계 (시연된 최고 수준)
+        comps = [c for c in verdict.components if 1 <= c.trl <= 9]
+        if comps:
+            critical = [c.trl for c in comps if c.is_critical] or [c.trl for c in comps]
+            lo, hi = min(critical), max(c.trl for c in comps)
+            if lo > hi:
+                lo, hi = hi, lo
+        else:
+            lo = hi = 0  # 판정 불가
+
         results[tid] = {
             "tech_id": tid,
-            "trl_range": [lo, hi],
+            "trl_range": [lo, hi] if comps else NOT_VERIFIED,
+            "range_derivation": (
+                "하한=핵심 구성요소 최저 단계, 상한=전체 구성요소 최고 단계. "
+                "LLM이 구간을 단언하지 않고 구성요소 판정에서 계산한다."
+            ),
             "components": [c.model_dump() for c in verdict.components],
             "rationale": verdict.rationale,
             "estimation_basis": "공개 정보 기반 추정",
@@ -350,6 +396,7 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
             ),
             "source_evidence_level": profile.get("evidence_level", NOT_VERIFIED),
         }
-        print(f"  TRL [{lo}, {hi}] · 구성요소 {len(verdict.components)}건")
+        print(f"  TRL [{lo}, {hi}] · 구성요소 {len(verdict.components)}건 "
+              f"(핵심 {sum(c.is_critical for c in verdict.components)}건)")
 
     return {"trl_result": results, "references": []}
