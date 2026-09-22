@@ -51,9 +51,7 @@ class EvidenceJudgement(BaseModel):
 class EvidenceItem(BaseModel):
     """규칙 7: 수치에 출처·기준 시점·단위·baseline을 붙인 근거."""
 
-    result_index: int = Field(
-        ge=1, description="수치가 나온 검색 결과 번호(1부터)"
-    )
+    result_index: int = Field(ge=1, description="수치가 나온 검색 결과 번호(1부터)")
     value: str = Field(description="수치 (예: '93.3%')")
     unit: str = Field(default="", description="단위 (예: %, x, GB, ms, $/token)")
     baseline: str = Field(default="", description="비교 기준선 (예: MHA, CPU-offload)")
@@ -127,6 +125,11 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    return default if value is None else float(value)
+
+
 def map_tag(evidence_score: int) -> str:
     """evidence_score(0~5)를 4단계 신뢰도 태그로 환산한다."""
     if evidence_score >= 5:
@@ -181,24 +184,64 @@ def _tech_terms(tech_info: dict, criterion_id: str | None = None) -> list[str]:
     return _text_terms(tech_info) + _measurement_terms(tech_info)
 
 
+_TECH_ALIASES: dict[str, list[str]] = {
+    "deepseek_v2_mla": ["DeepSeek-V2", "MLA", "Multi-head Latent Attention"],
+    "itme": ["ITME", "CXL hybrid memory"],
+}
+
+_CRITERION_SEEDS: dict[str, list[str]] = {
+    "3-2-a": [
+        "data center AI inference market size CAGR",
+        "LLM serving market TAM growth",
+        "long context inference workload growth",
+    ],
+    "3-2-b": [
+        "LLM inference cost per token",
+        "GPU memory TCO reduction",
+        "KV cache memory reduction",
+    ],
+    "3-2-c": [
+        "production deployment",
+        "hyperscaler adoption",
+        "commercial service",
+    ],
+    "3-2-d": [
+        "serving framework support",
+        "vLLM SGLang integration",
+        "standardization ecosystem",
+    ],
+}
+
+
+def _alias_terms(tech_info: dict, technology: str) -> str:
+    aliases = _TECH_ALIASES.get(str(tech_info.get("tech_id", "")))
+    if not aliases:
+        aliases = [technology]
+    return " ".join(aliases)
+
+
 def build_queries(
     criterion: dict, technology: str, tech_info: dict, attempt: int
 ) -> list[str]:
-    """루브릭의 evidence 목록과 기술 정보를 시드로 검색 쿼리를 만든다."""
-    question = criterion.get("question", "")
-    evidence = criterion.get("evidence", []) or []
-    seeds = " ".join(evidence)
+    """기술 alias·항목별 영문 시장 키워드·TechProfile을 시드로 검색 쿼리를 만든다."""
+    criterion_id = criterion.get("id", "")
+    alias = _alias_terms(tech_info, technology)
+    market_seeds = " ".join(_CRITERION_SEEDS.get(criterion_id, []))
+    rubric_terms = " ".join(criterion.get("evidence", []) or [])
     if attempt <= 1:
-        return [f"{technology} {question} {seeds}", f"{technology} {seeds}"]
-    tech_terms = " ".join(_tech_terms(tech_info, criterion.get("id")))
+        return [
+            f"{alias} {market_seeds}".strip(),
+            f"{alias} {rubric_terms}".strip(),
+        ]
+    tech_terms = " ".join(_tech_terms(tech_info, criterion_id))
     if attempt == 2:
         return [
-            f"{technology} {question} {seeds} {tech_terms}".strip(),
-            f"{technology} {seeds} market adoption TCO",
+            f"{alias} {market_seeds} {tech_terms}".strip(),
+            f"{alias} {rubric_terms} market adoption TCO".strip(),
         ]
     return [
-        f"{technology} {' '.join(evidence[:3])} market analysis",
-        f"{technology} market adoption ecosystem TCO trend",
+        f"{alias} {market_seeds} market analysis report".strip(),
+        f"{alias} {rubric_terms} market trend".strip(),
     ]
 
 
@@ -627,6 +670,8 @@ def _chat_model():
         "reasoning_effort": os.getenv("OPENAI_REASONING_EFFORT", "low"),
         "use_responses_api": True,
         "temperature": 0,
+        "timeout": _float_env("OPENAI_TIMEOUT_SECONDS", 60.0),
+        "max_retries": int(os.getenv("OPENAI_MAX_RETRIES", "0")),
     }
     if os.getenv("OPENAI_API_KEY"):
         kwargs["api_key"] = os.getenv("OPENAI_API_KEY")
@@ -659,6 +704,7 @@ def default_web_search(
         include_answer=False,
         include_raw_content=False,
         include_usage=True,
+        timeout=_float_env("TAVILY_TIMEOUT_SECONDS", 60.0),
     )
     return response.get("results", [])
 
