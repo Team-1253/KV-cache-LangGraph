@@ -1,0 +1,12 @@
+# 공통 실행 의존성
+langchain>=1.0.2
+langchain-community>=0.3.31
+langchain-openai>=1.0.1
+langgraph>=1.0.1
+pydantic>=2.0
+python-dotenv>=1.2.1
+
+# RAG (기술 조사 Agent / 시장·도메인 Agent 재사용 가능)
+faiss-cpu>=1.12.0
+sentence-transformers>=5.1.1   # BAAI/bge-m3 오픈소스 임베딩
+pypdf>=6.0.0                   # PyPDFLoader
