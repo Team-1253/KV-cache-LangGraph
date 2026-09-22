@@ -17,7 +17,9 @@ from agents.market_evaluation import (
     EvidenceJudgement,
     MarketDeps,
     RubricScore,
+    _search_settings,
     _source_type,
+    build_queries,
     load_rubric,
     map_tag,
     run_market_evaluation,
@@ -313,11 +315,36 @@ def test_structured_evidence_mapped_from_results():
         ("https://www.samsung.com/semiconductor/x", "vendor"),
         ("https://www.reuters.com/technology/x", "news"),
         ("https://medium.com/@x/y", "community"),
+        ("https://www.gartner.com/en/newsroom/x", "analyst"),
+        ("https://www.statista.com/statistics/x", "analyst"),
         ("https://example.com/x", "unknown"),
     ],
 )
 def test_source_type_classification(url, expected):
     assert _source_type(url) == expected
+
+
+def _criterion(criterion_id: str) -> dict:
+    return next(c for c in load_rubric()["criteria"] if c["id"] == criterion_id)
+
+
+def test_build_queries_uses_alias_and_market_seeds():
+    tech_info = make_state().get("technical_result", {})["deepseek_v2_mla"]
+    queries = build_queries(_criterion("3-2-a"), "DeepSeek-V2 MLA", tech_info, 1)
+    joined = " ".join(queries)
+    assert "MLA" in joined or "DeepSeek-V2" in joined
+    assert "market size" in joined
+
+
+def test_search_settings_domain_prefer_on_retry():
+    criterion = _criterion("3-2-a")
+    first = _search_settings(criterion, 1)
+    assert "include_domains" not in first
+
+    retry = _search_settings(criterion, 2)
+    assert retry["include_domains"]
+    assert retry["include_domains_mode"] == "prefer"
+    assert retry["depth"] == "advanced"
 
 
 def test_fallback_to_selected_technologies():
