@@ -304,6 +304,23 @@ def test_structured_evidence_mapped_from_results():
     assert ref["source_type"] == "peer_review"
 
 
+def test_references_include_all_used_sources():
+    results = [
+        _result(url="https://arxiv.org/abs/2405.1", title="Paper"),
+        _result(url="https://github.com/deepseek-ai/DeepSeek-V2", title="Repo"),
+    ]
+    item_evidence = [
+        EvidenceItem(result_index=1, value="93.3%", unit="%", baseline="MHA")
+    ]
+    deps = MarketDeps(FakeSearch(results), PerKeyJudge([4]), FakeScorer(4, item_evidence))
+    out = run_market_evaluation(make_state(), deps)
+
+    urls = {ref["url"] for ref in out["references"]}
+    # 숫자 근거에 없더라도 평가에 사용한 출처는 references에 포함되어야 한다.
+    assert "https://github.com/deepseek-ai/DeepSeek-V2" in urls
+    assert "https://arxiv.org/abs/2405.1" in urls
+
+
 @pytest.mark.parametrize(
     ("url", "expected"),
     [

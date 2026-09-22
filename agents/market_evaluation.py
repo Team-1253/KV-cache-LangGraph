@@ -98,6 +98,7 @@ class ItemState(_ItemStateRequired, total=False):
     confidence_tag: str
     sources: list[str]
     evidence: list[dict]
+    source_refs: list[dict]
 
 
 # --------------------------------------------------------------------------- #
@@ -347,6 +348,7 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
                 "confidence_tag": TAG_NOT_VERIFIED,
                 "sources": [],
                 "evidence": [],
+                "source_refs": [],
             }
         scored = deps.score_rubric(
             system_prompt,
@@ -366,6 +368,7 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
             "confidence_tag": map_tag(evidence_score),
             "sources": _sources_from_results(results),
             "evidence": evidence,
+            "source_refs": _source_refs(results),
         }
 
     return node
@@ -409,6 +412,18 @@ def _format_results(results: list[dict]) -> str:
 
 def _sources_from_results(results: list[dict]) -> list[str]:
     return [url for result in results if (url := result.get("url"))]
+
+
+def _source_refs(results: list[dict]) -> list[dict]:
+    """평가에 사용한 모든 출처의 메타데이터(참조 생성용)."""
+    return [
+        {
+            "source": result.get("title", ""),
+            "url": result.get("url", ""),
+            "as_of": result.get("published_date") or "",
+        }
+        for result in results
+    ]
 
 
 def _evidence_from_results(results: list[dict]) -> list[dict]:
@@ -545,7 +560,7 @@ def _source_type(url: str) -> str:
 def _to_references(key: str, items: dict[str, dict]) -> list[dict]:
     refs: list[dict] = []
     for item_id, item in items.items():
-        for evidence in item.get("evidence", []):
+        for evidence in item.get("source_refs") or item.get("evidence", []):
             url = evidence.get("url", "")
             refs.append(
                 {
@@ -663,6 +678,7 @@ def run_market_evaluation(
                 "rationale": final.get("rationale", ""),
                 "sources": final.get("sources", []),
                 "evidence": final.get("evidence", []),
+                "source_refs": final.get("source_refs", []),
                 "attempts": final.get("attempt", 0),
             }
 
