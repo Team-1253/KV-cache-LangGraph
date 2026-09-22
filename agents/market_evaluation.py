@@ -842,7 +842,7 @@ def _chat_model():
 @lru_cache(maxsize=1)
 def _tavily_wrapper():
     """LangChain Tavily 통합 래퍼(원시 검색 결과 dict 반환)."""
-    from langchain_tavily import TavilySearchAPIWrapper
+    from langchain_tavily.tavily_search import TavilySearchAPIWrapper
 
     return TavilySearchAPIWrapper(
         tavily_api_key=os.environ["TAVILY_API_KEY"],
