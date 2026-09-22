@@ -125,15 +125,44 @@ def map_tag(evidence_score: int) -> str:
 # --------------------------------------------------------------------------- #
 # Query building
 # --------------------------------------------------------------------------- #
-def _tech_terms(tech_info: dict) -> list[str]:
+def _measurement_terms(tech_info: dict) -> list[str]:
+    """TechProfile.measurements에서 metric/value/baseline/condition을 추출한다."""
     terms: list[str] = []
-    for key in ("summary", "performance", "limitations", "evidence"):
-        value = tech_info.get(key)
-        if isinstance(value, str):
-            terms.append(value)
-        elif isinstance(value, list):
-            terms.extend(str(item) for item in value)
-    return [term for term in terms if term]
+    for measurement in tech_info.get("measurements", []) or []:
+        if isinstance(measurement, dict):
+            joined = " ".join(
+                str(measurement.get(field, ""))
+                for field in ("metric", "value", "baseline", "condition")
+            ).strip()
+            if joined:
+                terms.append(joined)
+    return terms
+
+
+def _text_terms(tech_info: dict) -> list[str]:
+    """TechProfile의 서술 항목(overview·mechanism·scope·claims·limits)에서 용어를 추출한다."""
+    terms: list[str] = []
+    overview = tech_info.get("overview")
+    if isinstance(overview, str) and overview and overview != "NOT_VERIFIED":
+        terms.append(overview)
+    for field in ("mechanism", "scope", "claims", "limits_explicit", "limits_implicit"):
+        for item in tech_info.get(field, []) or []:
+            if isinstance(item, dict) and item.get("text"):
+                terms.append(str(item["text"]))
+    return terms
+
+
+def _tech_terms(tech_info: dict, criterion_id: str | None = None) -> list[str]:
+    """TechProfile에서 검색 시드 용어를 뽑는다.
+
+    `3-2-b`(비용·성능 효과)는 실험 측정치(`measurements`)를 우선 사용한다. 그 외 항목은
+    서술 항목(`overview`·`mechanism`·`scope`·`claims`·`limits`)을 우선한다.
+    """
+    if criterion_id == "3-2-b":
+        measurements = _measurement_terms(tech_info)
+        if measurements:
+            return measurements + _text_terms(tech_info)
+    return _text_terms(tech_info) + _measurement_terms(tech_info)
 
 
 def build_queries(
@@ -145,7 +174,7 @@ def build_queries(
     seeds = " ".join(evidence)
     if attempt <= 1:
         return [f"{technology} {question} {seeds}", f"{technology} {seeds}"]
-    tech_terms = " ".join(_tech_terms(tech_info))
+    tech_terms = " ".join(_tech_terms(tech_info, criterion.get("id")))
     if attempt == 2:
         return [
             f"{technology} {question} {seeds} {tech_terms}".strip(),
@@ -384,6 +413,38 @@ def _overall_rationale(technology: str, items: dict[str, dict]) -> str:
     return f"{technology} 시장성 종합 — " + " / ".join(parts)
 
 
+def _resolve_technologies(state: EvaluationState) -> list[dict]:
+    """`technical_result`(TechProfile)를 소비해 평가 대상 목록을 만든다.
+
+    `technical_result`는 `tech_id`("deepseek_v2_mla" | "itme")를 키로 사용하므로,
+    각 프로필의 `camp`(SW/HW)를 이용해 결과 키를 `sw`/`hw`로 정규화한다. 기술 조사
+    산출물이 없으면 `selected_technologies`로 폴백한다.
+    """
+    technical_result = state.get("technical_result", {}) or {}
+    selected = state.get("selected_technologies", {}) or {}
+    resolved: list[dict] = []
+    if isinstance(technical_result, dict) and technical_result:
+        for tech_id, profile in technical_result.items():
+            profile = profile if isinstance(profile, dict) else {}
+            camp = str(profile.get("camp", "")).lower()
+            key = camp if camp in ("sw", "hw") else tech_id
+            resolved.append(
+                {
+                    "tech_id": tech_id,
+                    "camp": profile.get("camp", ""),
+                    "key": key,
+                    "title": profile.get("title") or selected.get(key) or tech_id,
+                    "profile": profile,
+                }
+            )
+    else:
+        for key, title in selected.items():
+            resolved.append(
+                {"tech_id": key, "camp": "", "key": key, "title": title, "profile": {}}
+            )
+    return resolved
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -391,8 +452,6 @@ def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
     rubric = load_rubric()
     system_prompt = load_system_prompt()
     criteria = rubric.get("criteria", [])
-    technologies = state.get("selected_technologies", {}) or {}
-    technical_result = state.get("technical_result", {}) or {}
     eval_as_of = _eval_as_of()
 
     graph = build_item_graph(deps, system_prompt)
@@ -400,10 +459,10 @@ def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
     market_result: dict[str, dict] = {}
     references: list[dict] = []
 
-    for key, technology in technologies.items():
-        tech_info = (
-            technical_result.get(key, {}) if isinstance(technical_result, dict) else {}
-        )
+    for tech in _resolve_technologies(state):
+        key = tech["key"]
+        technology = tech["title"]
+        tech_info = tech["profile"]
         items: dict[str, dict] = {}
         for criterion in criteria:
             final = graph.invoke(
@@ -426,6 +485,8 @@ def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
 
         market_result[key] = {
             "technology": technology,
+            "tech_id": tech["tech_id"],
+            "camp": tech["camp"],
             "score": _total_score(items, criteria),
             "rationale": _overall_rationale(technology, items),
             "evidence": [
