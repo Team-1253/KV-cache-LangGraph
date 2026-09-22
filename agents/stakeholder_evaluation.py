@@ -304,7 +304,7 @@ def calculate_total_score(
 
 
 def prepare_assessment_for_state(
-    technology_key: Literal["sw", "hw"],
+    technology_id: str,
     assessment: TechnologyAssessment,
     rubric: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -318,9 +318,7 @@ def prepare_assessment_for_state(
         evidence_ids: list[str] = []
 
         for index, source in enumerate(criterion["evidence"], start=1):
-            evidence_id = (
-                f"stakeholder-{technology_key}-{criterion_id}-{index:02d}"
-            )
+            evidence_id = (f"stakeholder-{technology_id}-{criterion_id}-{index:02d}")   
 
             evidence_ids.append(evidence_id)
 
@@ -364,17 +362,19 @@ def prepare_assessment_for_state(
 
 # LangGraph 노드 완성
 
+REQUIRED_TECH_IDS = (
+    "deepseek_v2_mla",
+    "itme",
+)
+
+
 def stakeholder_evaluation_agent(
     state: EvaluationState,
 ) -> dict[str, Any]:
-    """SW와 HW 기술을 이해관계자 관점에서 평가한다."""
+    """기술 조사 결과를 이용해 기술별 이해관계자 평가를 수행한다."""
 
-    selected_technologies = state.get("selected_technologies")
     technical_result = state.get("technical_result")
     target_domain = state.get("target_domain")
-
-    if not selected_technologies:
-        raise ValueError("State에 selected_technologies가 없습니다.")
 
     if not technical_result:
         raise ValueError("State에 technical_result가 없습니다.")
@@ -382,95 +382,240 @@ def stakeholder_evaluation_agent(
     if not target_domain:
         raise ValueError("State에 target_domain이 없습니다.")
 
-    if "sw" not in selected_technologies or "hw" not in selected_technologies:
-        raise ValueError(
-            "selected_technologies에는 sw와 hw가 모두 있어야 합니다."
-        )
+    missing_tech_ids = [
+        tech_id
+        for tech_id in REQUIRED_TECH_IDS
+        if tech_id not in technical_result
+    ]
 
-    if "sw" not in technical_result or "hw" not in technical_result:
+    if missing_tech_ids:
         raise ValueError(
-            "technical_result에는 sw와 hw 조사 결과가 모두 있어야 합니다."
+            "technical_result에 다음 기술이 없습니다: "
+            + ", ".join(missing_tech_ids)
         )
 
     rubric = load_rubric()
 
-    sw_assessment = run_technology_assessment(
-        technology=selected_technologies["sw"],
-        target_domain=target_domain,
-        technical_context=technical_result["sw"],
-        rubric=rubric,
-    )
+    stakeholder_results: dict[str, Any] = {}
+    all_references: list[dict[str, Any]] = []
 
-    hw_assessment = run_technology_assessment(
-        technology=selected_technologies["hw"],
-        target_domain=target_domain,
-        technical_context=technical_result["hw"],
-        rubric=rubric,
-    )
+    for tech_id in REQUIRED_TECH_IDS:
+        tech_profile = technical_result[tech_id]
 
-    sw_result, sw_references = prepare_assessment_for_state(
-        technology_key="sw",
-        assessment=sw_assessment,
-        rubric=rubric,
-    )
+        if tech_profile.get("tech_id") != tech_id:
+            raise ValueError(
+                f"technical_result의 키와 TechProfile.tech_id가 다릅니다: {tech_id}"
+            )
 
-    hw_result, hw_references = prepare_assessment_for_state(
-        technology_key="hw",
-        assessment=hw_assessment,
-        rubric=rubric,
-    )
+        assessment = run_technology_assessment(
+            technology=tech_profile["title"],
+            target_domain=target_domain,
+            technical_context=tech_profile,
+            rubric=rubric,
+        )
+
+        state_result, references = prepare_assessment_for_state(
+            technology_id=tech_id,
+            assessment=assessment,
+            rubric=rubric,
+        )
+
+        stakeholder_results[tech_id] = state_result
+        all_references.extend(references)
 
     return {
-        "stakeholder_result": {
-            "sw": sw_result,
-            "hw": hw_result,
-        },
-        "references": sw_references + hw_references,
+        "stakeholder_result": stakeholder_results,
+        "references": all_references,
     }
-
 
 # --------- 테스트 코드
 if __name__ == "__main__":
     test_state: EvaluationState = {
         "selected_technologies": {
-            "sw": "DeepSeek-V2 MLA",
-            "hw": "SK hynix ITME",
+            "sw": "deepseek_v2_mla",
+            "hw": "itme",
         },
         "target_domain": "데이터센터",
         "technical_result": {
-            "sw": {
-                "summary": (
+            "deepseek_v2_mla": {
+                "tech_id": "deepseek_v2_mla",
+                "camp": "SW",
+                "title": "DeepSeek-V2 MLA",
+                "overview": (
                     "DeepSeek-V2 MLA는 Key와 Value 정보를 저차원 latent vector로 "
                     "압축해 KV Cache 크기를 줄이는 Attention 구조다."
                 ),
-                "performance": [
-                    "기존 Multi-Head Attention 대비 KV Cache 저장량 감소",
-                    "긴 Context와 높은 동시성을 지원하기 위한 구조",
+                "mechanism": [
+                    {
+                        "text": (
+                            "여러 Attention Head의 Key와 Value 정보를 공통 "
+                            "저차원 latent vector로 압축한다."
+                        ),
+                        "source": {
+                            "chunk_id": "deepseek-v2-page-4-chunk-1",
+                            "page": 4,
+                        },
+                    }
                 ],
-                "limitations": [
-                    "기존 모델에 적용하려면 모델 구조 변경이나 재학습이 필요할 수 있음",
-                    "Decoupled RoPE 등 추가적인 구조 복잡성이 존재함",
+                "scope": [
+                    {
+                        "text": (
+                            "DeepSeek-V2 모델의 장문 Context LLM 추론 환경을 "
+                            "평가 대상으로 한다."
+                        ),
+                        "source": {
+                            "chunk_id": "deepseek-v2-page-6-chunk-1",
+                            "page": 6,
+                        },
+                    }
                 ],
-                "evidence_ids": [
-                    "technical-sw-01",
+                "claims": [
+                    {
+                        "text": (
+                            "MLA가 기존 Multi-Head Attention보다 KV Cache "
+                            "저장량을 크게 줄일 수 있다고 주장한다."
+                        ),
+                        "baseline": "Multi-Head Attention",
+                        "source": {
+                            "chunk_id": "deepseek-v2-page-5-chunk-2",
+                            "page": 5,
+                        },
+                    }
                 ],
+                "measurements": [
+                    {
+                        "metric": "KV Cache reduction",
+                        "value": "93.3%",
+                        "baseline": "Multi-Head Attention",
+                        "condition": "논문에 제시된 DeepSeek-V2 모델 구성",
+                        "source": {
+                            "chunk_id": "deepseek-v2-page-5-chunk-3",
+                            "page": 5,
+                        },
+                    }
+                ],
+                "limits_explicit": [
+                    {
+                        "text": (
+                            "압축된 latent vector에 RoPE를 직접 적용하기 어려워 "
+                            "Decoupled RoPE 구조가 추가된다."
+                        ),
+                        "basis": "논문의 MLA 아키텍처 설명",
+                        "source": {
+                            "chunk_id": "deepseek-v2-page-6-chunk-2",
+                            "page": 6,
+                        },
+                    }
+                ],
+                "limits_implicit": [
+                    {
+                        "text": (
+                            "기존 모델에 MLA를 적용하려면 모델 구조 변경이나 "
+                            "재학습이 필요할 수 있다."
+                        ),
+                        "basis": "MLA가 모델 Attention 구조에 포함된다는 평가 조건",
+                        "source": {
+                            "chunk_id": "deepseek-v2-page-4-chunk-1",
+                            "page": 4,
+                        },
+                    }
+                ],
+                "evidence_level": "strong",
+                "retrieval": {
+                    "query_count": 5,
+                    "retrieved_chunk_count": 12,
+                    "used_chunk_count": 6,
+                },
             },
-            "hw": {
-                "summary": (
-                    "SK hynix ITME는 CXL 기반 Hybrid Memory를 활용해 "
-                    "LLM 추론의 메모리 계층을 확장하는 하드웨어 접근이다."
+            "itme": {
+                "tech_id": "itme",
+                "camp": "HW",
+                "title": "SK hynix ITME",
+                "overview": (
+                    "ITME는 CXL 기반 Hybrid Memory를 활용해 LLM 추론 시 "
+                    "사용할 수 있는 메모리 계층을 확장하는 하드웨어 접근이다."
                 ),
-                "performance": [
-                    "GPU 메모리 용량 제약을 완화하기 위한 메모리 확장 접근",
-                    "CXL 기반 메모리 계층과 데이터 이동 최적화",
+                "mechanism": [
+                    {
+                        "text": (
+                            "GPU 메모리와 CXL 기반 확장 메모리 사이에서 "
+                            "데이터를 배치하고 이동시킨다."
+                        ),
+                        "source": {
+                            "chunk_id": "itme-page-3-chunk-1",
+                            "page": 3,
+                        },
+                    }
                 ],
-                "limitations": [
-                    "새로운 메모리 장비와 서버 인프라 구성이 필요할 수 있음",
-                    "공개된 결과가 프로토타입 중심일 가능성이 있음",
+                "scope": [
+                    {
+                        "text": (
+                            "데이터센터 LLM 추론 환경과 CXL Hybrid Memory "
+                            "구성을 평가 대상으로 한다."
+                        ),
+                        "source": {
+                            "chunk_id": "itme-page-4-chunk-1",
+                            "page": 4,
+                        },
+                    }
                 ],
-                "evidence_ids": [
-                    "technical-hw-01",
+                "claims": [
+                    {
+                        "text": (
+                            "제한된 GPU 메모리 용량을 확장하고 LLM 추론의 "
+                            "메모리 병목을 완화할 수 있다고 주장한다."
+                        ),
+                        "baseline": "GPU 로컬 메모리만 사용하는 구성",
+                        "source": {
+                            "chunk_id": "itme-page-2-chunk-2",
+                            "page": 2,
+                        },
+                    }
                 ],
+                "measurements": [
+                    {
+                        "metric": "LLM inference throughput",
+                        "value": "논문 평가값 참조",
+                        "baseline": "기존 GPU 메모리 기반 시스템",
+                        "condition": "논문의 CXL Hybrid Memory 평가 환경",
+                        "source": {
+                            "chunk_id": "itme-page-7-chunk-1",
+                            "page": 7,
+                        },
+                    }
+                ],
+                "limits_explicit": [
+                    {
+                        "text": (
+                            "메모리 계층 확장을 위해 CXL 장비와 별도의 "
+                            "시스템 구성이 필요하다."
+                        ),
+                        "basis": "논문의 시스템 구성 설명",
+                        "source": {
+                            "chunk_id": "itme-page-4-chunk-2",
+                            "page": 4,
+                        },
+                    }
+                ],
+                "limits_implicit": [
+                    {
+                        "text": (
+                            "프로토타입 평가 결과와 실제 양산 데이터센터 환경의 "
+                            "성능 사이에 차이가 존재할 수 있다."
+                        ),
+                        "basis": "논문의 평가 플랫폼과 상용 환경 차이",
+                        "source": {
+                            "chunk_id": "itme-page-8-chunk-1",
+                            "page": 8,
+                        },
+                    }
+                ],
+                "evidence_level": "limited",
+                "retrieval": {
+                    "query_count": 5,
+                    "retrieved_chunk_count": 10,
+                    "used_chunk_count": 6,
+                },
             },
         },
     }
