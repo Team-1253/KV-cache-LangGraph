@@ -221,7 +221,7 @@ def run_technology_assessment(
     technical_context: Any,
     rubric: dict[str, Any],
 ) -> TechnologyAssessment:
-    """최초 평가 후 NOT_VERIFIED 항목만 한 번 재검색·재평가한다."""
+    """항목별로 한 번 검색하고 한 번 평가한다. 미확인 항목은 null로 반환한다."""
 
     load_environment()
     model = init_chat_model(
@@ -239,46 +239,25 @@ def run_technology_assessment(
         rubric=rubric,
     )
 
-    evaluated: dict[str, CriterionAssessment] = {}
-    search_results: dict[str, list[Any]] = {}
-    for attempt in range(2):  # 최초 검색 1회 + 미확인 항목의 재검색 1회
-        pending = [
-            criterion for criterion in rubric["criteria"]
-            if evaluated.get(criterion["id"], {}).get("status") != "VERIFIED"
-        ]
-        if not pending:
-            break
-        for criterion in pending:
-            query = f"{technology} {criterion['question']}"
-            if attempt == 1:
-                query += " " + " ".join(criterion["evidence"])
-            search_results.setdefault(criterion["id"], []).append({
-                "query": query,
-                "result": search.invoke({"query": query}),
-            })
-        response = model.invoke([
-            SystemMessage(content=load_system_prompt()),
-            HumanMessage(content=request + "\n\n" + json.dumps({
-                "search_results": search_results,
-                "previous_assessments": evaluated,
-                "reevaluate_ids": [c["id"] for c in pending],
-                "instruction": "다섯 항목을 모두 반환하되, 이전 VERIFIED 항목은 유지하세요. 근거가 없으면 NOT_VERIFIED와 null을 반환하세요.",
-            }, ensure_ascii=False)),
-        ])
-        for item in response["criteria"]:
-            if item["status"] == "NOT_VERIFIED":
-                item["score"] = None
-        validated = validate_assessment(response)
-        by_id = {item["criterion_id"]: item for item in validated["criteria"]}
-        for criterion in pending:
-            evaluated[criterion["id"]] = by_id[criterion["id"]]
-
-    criteria = [evaluated[c["id"]] for c in rubric["criteria"]]
-    return validate_assessment({
-        "technology": technology,
-        "criteria": criteria,
-        "summary": " / ".join(f"{item['criterion_id']}: {item['rationale']}" for item in criteria),
-    })
+    search_results: dict[str, Any] = {}
+    for criterion in rubric["criteria"]:
+        query = f"{technology} {criterion['question']}"
+        search_results[criterion["id"]] = {
+            "query": query,
+            "result": search.invoke({"query": query}),
+        }
+    response = model.invoke([
+        SystemMessage(content=load_system_prompt()),
+        HumanMessage(content=request + "\n\n" + json.dumps({
+            "search_results": search_results,
+            "instruction": "다섯 항목을 모두 반환하세요. 미확인 항목도 생략하지 말고 NOT_VERIFIED와 null로 반환하세요. 재검색·재평가는 없습니다.",
+        }, ensure_ascii=False)),
+    ])
+    response["technology"] = technology
+    for item in response["criteria"]:
+        if item["status"] == "NOT_VERIFIED":
+            item["score"] = None
+    return validate_assessment(response)
 
 
 # 총점 계산 및 출처 정리

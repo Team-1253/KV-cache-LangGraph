@@ -9,14 +9,7 @@
     "item_count": 5,
     "weighting": "동일 비중",
     "total_score_formula": "sum(scores) / 25 * 100",
-    "not_verified": "조사했지만 근거를 확인하지 못한 경우",
-    "missing_data_policy": {
-      "initial_search_attempts": 1,
-      "query_rewrite_attempts": 1,
-      "final_not_verified_score": null,
-      "penalty_calculation_value": 0,
-      "description": "재검색 후에도 NOT_VERIFIED이면 항목 점수는 null로 보존하고 근거 부족 감점 점수 계산에서만 0점으로 처리한다."
-    }
+    "not_verified": "조사했지만 근거를 확인하지 못한 경우"
   },
   "criteria": [
     {
