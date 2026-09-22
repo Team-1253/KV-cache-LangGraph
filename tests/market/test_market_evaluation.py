@@ -17,6 +17,9 @@ from agents.market_evaluation import (
     EvidenceJudgement,
     MarketDeps,
     RubricScore,
+    _dispatch_items,
+    _merge_items,
+    _resolve_technologies,
     _search_settings,
     _source_type,
     build_queries,
@@ -397,6 +400,44 @@ def test_criteria_filter_limits_items():
     assert list(out["market_result"]["deepseek_v2_mla"]["items"].keys()) == ["3-2-a"]
     # 1개 항목 x 5점 기준 -> 4 / 5 * 100
     assert out["market_result"]["deepseek_v2_mla"]["score"] == pytest.approx(80.0)
+
+
+def test_merge_items_deep_merges():
+    left = {"deepseek_v2_mla": {"3-2-a": {"score": 4}}}
+    right = {"deepseek_v2_mla": {"3-2-b": {"score": 3}}, "itme": {"3-2-a": {"score": 2}}}
+    merged = _merge_items(left, right)
+    assert merged == {
+        "deepseek_v2_mla": {"3-2-a": {"score": 4}, "3-2-b": {"score": 3}},
+        "itme": {"3-2-a": {"score": 2}},
+    }
+    assert left == {"deepseek_v2_mla": {"3-2-a": {"score": 4}}}  # 원본 불변
+
+
+def test_dispatch_items_fans_out():
+    technologies = _resolve_technologies(make_state())
+    criteria = load_rubric()["criteria"]
+    sends = _dispatch_items(
+        {
+            "technologies": technologies,
+            "criteria": criteria,
+            "as_of": "",
+            "items": {},
+            "references": [],
+            "market_result": {},
+        }
+    )
+    assert len(sends) == len(technologies) * len(criteria)
+    assert {send.node for send in sends} == {"item"}
+    payload = sends[0].arg
+    assert {"tech_id", "technology", "profile", "criterion"} <= set(payload)
+
+
+def test_pipeline_evaluates_every_tech_and_criterion():
+    deps, *_ = make_deps([_result()], [4])
+    out = run_market_evaluation(make_state(), deps)
+    criteria_ids = [c["id"] for c in load_rubric()["criteria"]]
+    for tech_id in ("deepseek_v2_mla", "itme"):
+        assert list(out["market_result"][tech_id]["items"].keys()) == criteria_ids
 
 
 def test_search_retry_recovers():
