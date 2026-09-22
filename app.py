@@ -53,3 +53,6 @@ if __name__ == "__main__":
         "references": [],
     })
     print(result["final_report"])
+    # save final_report to .../final_report.md
+    with open("outputs/final_report.md", "w", encoding="utf-8") as f:
+        f.write(result["final_report"])

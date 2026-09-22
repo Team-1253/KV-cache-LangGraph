@@ -84,20 +84,3 @@ def report_generation_agent(state: EvaluationState) -> dict:
             ),
             "run_errors": errors,
         }
-
-
-if __name__ == "__main__":
-    import sys
-
-    from dotenv import load_dotenv
-
-    load_dotenv(_ROOT / ".env", override=True)
-    src = Path(sys.argv[1]) if len(sys.argv) > 1 else _ROOT / "data" / "sample_state.json"
-    dst = Path(sys.argv[2]) if len(sys.argv) > 2 else _ROOT / "outputs" / "final_report.md"
-    import json
-
-    report = report_generation_agent(json.loads(src.read_text(encoding="utf-8")))["final_report"]
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(report, encoding="utf-8")
-    print(report)
-    print(f"\n[report] 저장: {dst}")
