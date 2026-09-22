@@ -68,3 +68,27 @@ START
 - 평가 점수와 판단 근거가 함께 저장된다.
 - 보고서가 `SUMMARY`로 시작하고 `REFERENCE`로 끝난다.
 - 기술의 우열이나 단일 승자를 결정하지 않는다.
+
+
+## 브랜치 명명 규칙
+
+역할별 기능 브랜치는 `feature/<역할명>` 형식을 사용합니다.
+
+| 담당 역할 | 브랜치명 |
+| --- | --- |
+| 기술 조사·TRL | `feature/technical-research` |
+| 시장 평가 | `feature/market-evaluation` |
+| 이해관계자 평가 | `feature/stakeholder-evaluation` |
+| 도메인 평가 | `feature/domain-evaluation` |
+| 평가 종합 | `feature/evaluation-synthesis` |
+| 보고서 생성 | `feature/report-generation` |
+| 공통 Tool 작업 | `feature/share-tools` |
+
+작업 종류에 따라 다음 접두사를 사용합니다.
+
+- 기능 개발: `feature/<작업명>`
+- 버그 수정: `fix/<작업명>`
+- 문서 수정: `docs/<작업명>`
+- 리팩터링: `refactor/<작업명>`
+
+브랜치명은 영문 소문자와 하이픈(`-`)만 사용하고, 한 브랜치에는 한 역할 또는 하나의 작업만 포함합니다.
