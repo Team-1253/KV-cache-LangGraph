@@ -399,7 +399,9 @@ def test_criteria_filter_limits_items():
     assert out["market_result"]["deepseek_v2_mla"]["score"] == pytest.approx(80.0)
 
 
-def test_partial_search_failure_is_tolerated():
+def test_search_retry_recovers():
+    """일시 오류(재시도 대상)는 RetryPolicy가 재시도해 복구한다."""
+
     class FlakySearch:
         def __init__(self):
             self.calls = 0
@@ -407,10 +409,26 @@ def test_partial_search_failure_is_tolerated():
         def __call__(self, query, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                raise RuntimeError("network")
+                raise ConnectionError("transient network")
             return [_result()]
 
-    scorer = FakeScorer(score=4)
-    deps = MarketDeps(FlakySearch(), PerKeyJudge([4]), scorer)
+    search = FlakySearch()
+    deps = MarketDeps(search, PerKeyJudge([4]), FakeScorer(score=4))
     out = run_market_evaluation(make_state(), deps)
-    assert out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]["confidence_tag"] == TAG_MEDIUM
+    item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
+    assert item["confidence_tag"] == TAG_MEDIUM
+    assert search.calls > 1  # 재시도 발생
+
+
+def test_search_error_handler_falls_back_to_empty():
+    """재시도 불가 오류는 error_handler가 빈 결과로 폴백한다."""
+
+    class BrokenSearch:
+        def __call__(self, query, **kwargs):
+            raise RuntimeError("permanent failure")
+
+    deps = MarketDeps(BrokenSearch(), PerKeyJudge([4]), FakeScorer(score=4))
+    out = run_market_evaluation(make_state(), deps)
+    item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
+    assert item["confidence_tag"] == TAG_NOT_VERIFIED
+    assert item["score"] == 0

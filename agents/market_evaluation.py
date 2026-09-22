@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
+from langgraph.errors import NodeError
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, RetryPolicy
 from pydantic import BaseModel, Field
 
 from agents.state import EvaluationState
@@ -304,13 +306,15 @@ def _search_node(deps: MarketDeps) -> Callable[[ItemState], dict]:
         settings = _search_settings(state["criterion"], int(state.get("attempt", 1)))
         results: list[dict] = []
         for query in state.get("queries", []):
-            try:
-                results.extend(deps.web_search(query, **settings) or [])
-            except Exception:  # noqa: BLE001 - 검색 실패는 빈 결과로 처리
-                continue
+            results.extend(deps.web_search(query, **settings) or [])
         return {"results": _dedupe_results(results)}
 
     return node
+
+
+def _search_error_handler(state: ItemState, error: NodeError) -> Command:
+    """검색이 재시도 후에도 실패하면 빈 결과로 폴백한다."""
+    return Command(update={"results": []})
 
 
 def _judge_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], dict]:
@@ -350,23 +354,13 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
                 "evidence": [],
                 "source_refs": [],
             }
-        try:
-            scored = deps.score_rubric(
-                system_prompt,
-                state["criterion"],
-                state["technology"],
-                results,
-                evidence_score,
-            )
-        except Exception:  # noqa: BLE001 - 채점 불가 시 0점 처리
-            return {
-                "score": 0,
-                "rationale": "채점을 수행할 수 없어 0점 처리",
-                "confidence_tag": TAG_NOT_VERIFIED,
-                "sources": [],
-                "evidence": [],
-                "source_refs": [],
-            }
+        scored = deps.score_rubric(
+            system_prompt,
+            state["criterion"],
+            state["technology"],
+            results,
+            evidence_score,
+        )
         evidence = (
             _evidence_from_items(scored.evidence, results)
             if scored.evidence
@@ -384,13 +378,37 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
     return node
 
 
+def _score_error_handler(state: ItemState, error: NodeError) -> Command:
+    """채점이 재시도 후에도 실패하면 0점(NOT_VERIFIED)으로 폴백한다."""
+    return Command(
+        update={
+            "score": 0,
+            "rationale": "채점을 수행할 수 없어 0점 처리",
+            "confidence_tag": TAG_NOT_VERIFIED,
+            "sources": [],
+            "evidence": [],
+            "source_refs": [],
+        }
+    )
+
+
 def build_item_graph(deps: MarketDeps, system_prompt: str):
     """항목 1건의 상태 전이를 담당하는 내부 서브그래프."""
     graph = StateGraph(ItemState)
     graph.add_node("query", _query_node())
-    graph.add_node("search", _search_node(deps))
+    graph.add_node(
+        "search",
+        _search_node(deps),
+        retry_policy=RetryPolicy(max_attempts=3),
+        error_handler=_search_error_handler,
+    )
     graph.add_node("judge", _judge_node(system_prompt, deps))
-    graph.add_node("score", _score_node(system_prompt, deps))
+    graph.add_node(
+        "score",
+        _score_node(system_prompt, deps),
+        retry_policy=RetryPolicy(max_attempts=2),
+        error_handler=_score_error_handler,
+    )
 
     graph.add_edge(START, "query")
     graph.add_edge("query", "search")
