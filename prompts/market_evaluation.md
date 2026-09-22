@@ -83,7 +83,9 @@
 
 확정된 근거를 받아 해당 criterion의 `scores`(1~5) 기준표에 맞춰 점수를 매긴다.
 
-- 반환: `score`(1~5)와 `rationale`.
+- 반환: `score`(1~5), `rationale`, `evidence[]`.
+- `evidence[]` 각 항목: `result_index`(수치가 나온 검색 결과 번호), `value`(수치),
+  `unit`(단위), `baseline`(비교 기준선), `note`(조건 설명). 수치가 없으면 빈 목록으로 둔다.
 - `NOT_VERIFIED`면 `score = 1`.
 - `rationale`에는 판단 근거를 요약하고, 정량 수치는 기준 시점·단위·baseline을 함께 적는다.
 - 감점 규칙을 위반한 근거는 점수에 반영하지 않는다.
@@ -103,7 +105,7 @@
       "score": 62.5,
       "rationale": "종합 요약",
       "evidence": [
-        {"source": "...", "url": "...", "as_of": "2024-05", "unit": "x", "baseline": "MHA", "value": 93.3}
+        {"source": "...", "url": "...", "as_of": "2024-05", "unit": "x", "baseline": "MHA", "value": "93.3"}
       ],
       "items": {
         "3-2-a": {

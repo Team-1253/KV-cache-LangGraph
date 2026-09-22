@@ -18,6 +18,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypedDict
+from urllib.parse import urlparse
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
@@ -47,11 +48,26 @@ class EvidenceJudgement(BaseModel):
     reason: str = Field(description="판정 이유")
 
 
+class EvidenceItem(BaseModel):
+    """규칙 7: 수치에 출처·기준 시점·단위·baseline을 붙인 근거."""
+
+    result_index: int = Field(
+        ge=1, description="수치가 나온 검색 결과 번호(1부터)"
+    )
+    value: str = Field(description="수치 (예: '93.3%')")
+    unit: str = Field(default="", description="단위 (예: %, x, GB, ms, $/token)")
+    baseline: str = Field(default="", description="비교 기준선 (예: MHA, CPU-offload)")
+    note: str = Field(default="", description="보조 설명(조건 등)")
+
+
 class RubricScore(BaseModel):
     """확정 근거에 대한 루브릭 채점."""
 
     score: int = Field(ge=1, le=5)
     rationale: str = Field(description="판단 근거 요약")
+    evidence: list[EvidenceItem] = Field(
+        default_factory=list, description="판단을 뒷받침하는 정량 근거 목록"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -276,12 +292,17 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
             results,
             evidence_score,
         )
+        evidence = (
+            _evidence_from_items(scored.evidence, results)
+            if scored.evidence
+            else _evidence_from_results(results)
+        )
         return {
             "score": int(scored.score),
             "rationale": scored.rationale,
             "confidence_tag": map_tag(evidence_score),
             "sources": _sources_from_results(results),
-            "evidence": _evidence_from_results(results),
+            "evidence": evidence,
         }
 
     return node
@@ -335,31 +356,109 @@ def _evidence_from_results(results: list[dict]) -> list[dict]:
             "as_of": result.get("published_date") or "",
             "unit": "",
             "baseline": "",
-            "value": None,
+            "value": "",
         }
         for result in results
     ]
 
 
-def _source_type(url: str) -> str:
-    host = url.lower()
-    if any(
-        domain in host
-        for domain in (
-            "arxiv.org",
-            "acm.org",
-            "ieee.org",
-            "usenix.org",
-            "openreview.net",
+def _evidence_from_items(scored_evidence: list, results: list[dict]) -> list[dict]:
+    """채점 LLM이 구조화한 수치 근거(EvidenceItem)를 검색 결과와 매핑한다."""
+    evidence: list[dict] = []
+    for entry in scored_evidence:
+        index = int(entry.result_index) - 1
+        result = results[index] if 0 <= index < len(results) else {}
+        evidence.append(
+            {
+                "source": result.get("title", ""),
+                "url": result.get("url", ""),
+                "as_of": result.get("published_date") or "",
+                "unit": entry.unit,
+                "baseline": entry.baseline,
+                "value": entry.value,
+            }
         )
-    ):
+    return evidence
+
+
+_PEER_REVIEW_DOMAINS = (
+    "arxiv.org",
+    "acm.org",
+    "ieee.org",
+    "usenix.org",
+    "openreview.net",
+    "springer.com",
+    "sciencedirect.com",
+    "nature.com",
+    "science.org",
+    "mlr.press",
+    "aclweb.org",
+    "neurips.cc",
+)
+_OFFICIAL_DOMAINS = (
+    "github.com",
+    "huggingface.co",
+    "readthedocs.io",
+    "openai.com",
+    "deepseek.com",
+    "paperswithcode.com",
+    "microsoft.com",
+    "cloud.google.com",
+    "aws.amazon.com",
+)
+_VENDOR_DOMAINS = (
+    "nvidia.com",
+    "samsung.com",
+    "skhynix.com",
+    "intel.com",
+    "amd.com",
+    "micron.com",
+    "hpe.com",
+    "dell.com",
+)
+_NEWS_DOMAINS = (
+    "reuters.com",
+    "techcrunch.com",
+    "theverge.com",
+    "zdnet.com",
+    "datacenterdynamics.com",
+    "theregister.com",
+    "bloomberg.com",
+    "cnbc.com",
+    "arstechnica.com",
+    "venturebeat.com",
+    "tomshardware.com",
+    "anandtech.com",
+)
+_COMMUNITY_DOMAINS = (
+    "medium.com",
+    "tistory.com",
+    "substack.com",
+    "youtube.com",
+    "youtu.be",
+    "reddit.com",
+    "news.ycombinator.com",
+    "velog.io",
+    "brunch.co.kr",
+    "blog.naver.com",
+)
+
+
+def _source_type(url: str) -> str:
+    host = urlparse(url).netloc.lower() or url.lower()
+    if any(domain in host for domain in _PEER_REVIEW_DOMAINS):
         return "peer_review"
-    if any(domain in host for domain in ("github.com", "huggingface.co", "docs.")):
-        return "official"
-    if any(
-        domain in host
-        for domain in ("reddit.com", "news.ycombinator.com", "medium.com")
+    if any(domain in host for domain in _VENDOR_DOMAINS):
+        return "vendor"
+    if (
+        any(domain in host for domain in _OFFICIAL_DOMAINS)
+        or host.startswith("docs.")
+        or ".docs." in host
     ):
+        return "official"
+    if any(domain in host for domain in _NEWS_DOMAINS):
+        return "news"
+    if any(domain in host for domain in _COMMUNITY_DOMAINS) or host.startswith("blog."):
         return "community"
     return "unknown"
 
@@ -603,7 +702,11 @@ def default_score_rubric(
         f"주의: {' '.join(criterion.get('cautions', []))}\n"
         f"근거 신뢰도 판정 점수: {evidence_score}\n\n"
         f"확정된 검색 결과:\n{_format_results(results)}\n\n"
-        "위 근거에 따라 score(1~5)와 rationale을 반환하라."
+        "위 근거에 따라 score(1~5)와 rationale을 반환하라. "
+        "또한 판단을 뒷받침하는 정량 수치를 evidence에 구조화하라. 각 항목은 "
+        "result_index(수치가 나온 검색 결과 번호), value(수치), unit(단위), "
+        "baseline(비교 기준선), note(조건 설명)를 포함한다. "
+        "수치가 없으면 evidence는 빈 목록으로 둔다."
     )
     return model.invoke(
         [SystemMessage(content=system_prompt), HumanMessage(content=user)]
