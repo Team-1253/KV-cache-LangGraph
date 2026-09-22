@@ -818,22 +818,57 @@ def default_web_search(
     return response.get("results", [])
 
 
+_JUDGE_TEMPLATE = """기술: {technology}
+평가 항목: {criterion_id} — {question}
+확인 근거: {evidence}
+주의: {cautions}
+
+검색 결과:
+{results}
+
+위 결과의 근거 품질을 0~5로 판정해 evidence_score와 reason을 반환하라."""
+
+_SCORE_TEMPLATE = """기술: {technology}
+평가 항목: {criterion_id} — {question}
+채점 기준:
+{score_table}
+주의: {cautions}
+근거 신뢰도 판정 점수: {evidence_score}
+
+확정된 검색 결과:
+{results}
+
+위 근거에 따라 score(1~5)와 rationale을 반환하라. 또한 판단을 뒷받침하는 정량 수치를
+evidence에 구조화하라. 각 항목은 result_index(수치가 나온 검색 결과 번호), value(수치),
+unit(단위), baseline(비교 기준선), note(조건 설명)를 포함한다. 수치가 없으면 evidence는
+빈 목록으로 둔다."""
+
+
+def _build_prompt(system_prompt: str, human_template: str):
+    """시스템 프롬프트(비템플릿)와 휴먼 템플릿을 묶은 ChatPromptTemplate를 만든다."""
+    from langchain_core.messages import SystemMessage
+    from langchain_core.prompts import ChatPromptTemplate
+
+    return ChatPromptTemplate.from_messages(
+        [SystemMessage(content=system_prompt), ("human", human_template)]
+    )
+
+
 def default_judge_evidence(
     system_prompt: str, criterion: dict, technology: str, results: list[dict]
 ) -> EvidenceJudgement:
-    from langchain_core.messages import HumanMessage, SystemMessage
-
-    model = _chat_model().with_structured_output(EvidenceJudgement)
-    user = (
-        f"기술: {technology}\n"
-        f"평가 항목: {criterion.get('id')} — {criterion.get('question')}\n"
-        f"확인 근거: {', '.join(criterion.get('evidence', []))}\n"
-        f"주의: {' '.join(criterion.get('cautions', []))}\n\n"
-        f"검색 결과:\n{_format_results(results)}\n\n"
-        "위 결과의 근거 품질을 0~5로 판정해 evidence_score와 reason을 반환하라."
+    chain = _build_prompt(system_prompt, _JUDGE_TEMPLATE) | _chat_model().with_structured_output(
+        EvidenceJudgement
     )
-    return model.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=user)]
+    return chain.invoke(
+        {
+            "technology": technology,
+            "criterion_id": criterion.get("id"),
+            "question": criterion.get("question"),
+            "evidence": ", ".join(criterion.get("evidence", [])),
+            "cautions": " ".join(criterion.get("cautions", [])),
+            "results": _format_results(results),
+        }
     )
 
 
@@ -844,27 +879,22 @@ def default_score_rubric(
     results: list[dict],
     evidence_score: int,
 ) -> RubricScore:
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     score_table = "\n".join(
         f"{level}: {desc}" for level, desc in criterion.get("scores", {}).items()
     )
-    model = _chat_model().with_structured_output(RubricScore)
-    user = (
-        f"기술: {technology}\n"
-        f"평가 항목: {criterion.get('id')} — {criterion.get('question')}\n"
-        f"채점 기준:\n{score_table}\n"
-        f"주의: {' '.join(criterion.get('cautions', []))}\n"
-        f"근거 신뢰도 판정 점수: {evidence_score}\n\n"
-        f"확정된 검색 결과:\n{_format_results(results)}\n\n"
-        "위 근거에 따라 score(1~5)와 rationale을 반환하라. "
-        "또한 판단을 뒷받침하는 정량 수치를 evidence에 구조화하라. 각 항목은 "
-        "result_index(수치가 나온 검색 결과 번호), value(수치), unit(단위), "
-        "baseline(비교 기준선), note(조건 설명)를 포함한다. "
-        "수치가 없으면 evidence는 빈 목록으로 둔다."
-    )
-    return model.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=user)]
+    chain = _build_prompt(
+        system_prompt, _SCORE_TEMPLATE
+    ) | _chat_model().with_structured_output(RubricScore)
+    return chain.invoke(
+        {
+            "technology": technology,
+            "criterion_id": criterion.get("id"),
+            "question": criterion.get("question"),
+            "score_table": score_table,
+            "cautions": " ".join(criterion.get("cautions", [])),
+            "evidence_score": evidence_score,
+            "results": _format_results(results),
+        }
     )
 
 
