@@ -13,9 +13,11 @@ from agents.market_evaluation import (
     TAG_MEDIUM,
     TAG_NOT_VERIFIED,
     TAG_WEAK,
+    EvidenceItem,
     EvidenceJudgement,
     MarketDeps,
     RubricScore,
+    _source_type,
     load_rubric,
     map_tag,
     run_market_evaluation,
@@ -60,13 +62,16 @@ class PerKeyJudge:
 
 
 class FakeScorer:
-    def __init__(self, score=3):
+    def __init__(self, score=3, evidence=None):
         self._score = score
+        self._evidence = evidence or []
         self.calls = 0
 
     def __call__(self, system_prompt, criterion, technology, results, evidence_score):
         self.calls += 1
-        return RubricScore(score=self._score, rationale="rationale")
+        return RubricScore(
+            score=self._score, rationale="rationale", evidence=self._evidence
+        )
 
 
 def make_deps(results, judge_scores, rubric_score=3):
@@ -270,6 +275,49 @@ def test_consumes_techprofile_schema():
     assert "latent vector" in joined
     assert "93.3%" in joined
     assert "CPU-offload" in joined
+
+
+def test_structured_evidence_mapped_from_results():
+    item_evidence = [
+        EvidenceItem(
+            result_index=1, value="93.3%", unit="%", baseline="MHA", note="long context"
+        )
+    ]
+    search = FakeSearch(
+        [_result(url="https://arxiv.org/abs/2405.1", title="Paper", date="2024-05")]
+    )
+    scorer = FakeScorer(score=4, evidence=item_evidence)
+    deps = MarketDeps(search, PerKeyJudge([4]), scorer)
+    out = run_market_evaluation(make_state(), deps)
+
+    evidence = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]["evidence"]
+    assert evidence and evidence[0]["value"] == "93.3%"
+    assert evidence[0]["unit"] == "%"
+    assert evidence[0]["baseline"] == "MHA"
+    assert evidence[0]["url"] == "https://arxiv.org/abs/2405.1"
+    assert evidence[0]["as_of"] == "2024-05"
+
+    ref = out["references"][0]
+    assert ref["url"] == "https://arxiv.org/abs/2405.1"
+    assert ref["source_type"] == "peer_review"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://arxiv.org/abs/2405.1", "peer_review"),
+        ("https://dl.acm.org/doi/10.1145/x", "peer_review"),
+        ("https://github.com/deepseek-ai/DeepSeek-V2", "official"),
+        ("https://huggingface.co/deepseek-ai/DeepSeek-V2", "official"),
+        ("https://docs.nvidia.com/x", "vendor"),
+        ("https://www.samsung.com/semiconductor/x", "vendor"),
+        ("https://www.reuters.com/technology/x", "news"),
+        ("https://medium.com/@x/y", "community"),
+        ("https://example.com/x", "unknown"),
+    ],
+)
+def test_source_type_classification(url, expected):
+    assert _source_type(url) == expected
 
 
 def test_fallback_to_selected_technologies():
