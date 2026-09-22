@@ -10,6 +10,7 @@ from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain.chat_models import init_chat_model
 from langchain_tavily import TavilySearch
+from langgraph.errors import GraphRecursionError
 
 from agents.state import EvaluationState
 
@@ -268,7 +269,7 @@ def run_technology_assessment(
                 }
             ]
         },
-        config={"recursion_limit": 10},
+        config={"recursion_limit": 15},
     )
 
     assessment = result.get("structured_response")
@@ -428,12 +429,30 @@ def stakeholder_evaluation_agent(
                 f"technical_result의 키와 TechProfile.tech_id가 다릅니다: {tech_id}"
             )
 
-        assessment = run_technology_assessment(
-            technology=tech_profile["title"],
-            target_domain=target_domain,
-            technical_context=tech_profile,
-            rubric=rubric,
-        )
+        try:
+            assessment = run_technology_assessment(
+                technology=tech_profile["title"],
+                target_domain=target_domain,
+                technical_context=tech_profile,
+                rubric=rubric,
+            )
+        except GraphRecursionError:
+            reason = "이해관계자 조사 중 실행 단계 제한에 도달해 평가를 완료하지 못했습니다."
+            print(f"[이해관계자 평가] {tech_profile['title']}: {reason}")
+            assessment = {
+                "technology": tech_profile["title"],
+                "criteria": [
+                    {
+                        "criterion_id": item["id"],
+                        "status": "NOT_VERIFIED",
+                        "score": None,
+                        "rationale": reason,
+                        "evidence": [],
+                    }
+                    for item in rubric["criteria"]
+                ],
+                "summary": reason,
+            }
 
         state_result, references = prepare_assessment_for_state(
             technology_id=tech_id,

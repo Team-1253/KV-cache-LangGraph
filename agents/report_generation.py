@@ -1,918 +1,103 @@
-"""보고서 생성 Agent.
+"""상류의 실제 자료를 읽어 장별 보고서를 작성하고, 실패해도 원자료를 남긴다."""
 
-평가가 끝난 State 를 최종 보고서 문자열 하나로 바꾼다.
-바깥(`app.py`)에서 보면 노드 1개이고 출력 State Key 도 `final_report` 하나지만,
-안에서는 장별 작성 -> 검증 -> 재작성 -> 조립을 도는 작은 그래프가 돈다.
-작업용 중간 키(`sections`, `issues` 등)는 이 모듈 안의 `_ReportState` 에만 있고
-공용 `EvaluationState` 로 새어 나가지 않는다.
-
-    prepare ─┬→ section_1 ┐
-             ├→ ...       ├→ summary → validate ─┬→ revise ─┐
-             └→ section_6 ┘        ↑              └→ render → END
-                                   └──────────────┘
-
-장 구성은 고정이지만 **각 장에서 무엇을 쓸지는 들어온 자료가 정한다.**
-작성 항목마다 `requires` 로 "이 항목을 쓰려면 State 의 무엇이 있어야 하는가" 를 선언해 두고,
-`_prepare` 가 실제 State 를 훑어 살아남은 항목만 프롬프트에 넣는다.
-자료가 없는 항목은 지시 자체를 하지 않으므로 LLM 이 지어낼 여지가 없고,
-목표 분량도 살아남은 항목 수에 비례해 줄여 물타기를 막는다.
-
-설계 원칙: 틀리면 안 되는 것은 LLM 에게 맡기지 않는다.
-  - 관점별 평가 비교표 → `_score_table` 이 State 값으로 직접 렌더링
-  - REFERENCE         → `_render` 가 실제 인용된 출처만 규정 형식으로 출력
-  - 근거 통계·편향 방지 조치 → `_prepare` 가 계산해서 넘김
-LLM 은 서술만 한다.
-"""
-
-import json
-import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypedDict
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
-from langgraph.graph import END, START, StateGraph
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from agents.resilient import (
+    dump_data, error_record, fallback_report, response_text, source_appendix, source_data,
+)
 from agents.state import EvaluationState
-
-MODEL_NAME = "gpt-4o-mini"
-SUMMARY_MAX_CHARS = 900          # SUMMARY 는 1/2 페이지를 넘지 않는다
-CHARS_PER_POINT = 300            # 살아남은 작성 항목 1개당 목표 분량
-MAX_EXPANSION = 2.0              # 주입 자료 글자수의 이 배수를 넘겨 쓰라고 요구하지 않는다
-MIN_CHARS, MAX_CHARS = 200, 2000
-MIN_RATIO = 0.7                  # 목표 분량의 이 비율에 못 미치면 재작성
-MAX_REVISION = 2                 # 재작성 상한. 넘으면 문제를 안고 출력한다
-
-CITE = re.compile(r"\[ref:([^\]\s]+)\]")
-HONORIFIC = re.compile(r"(습니다|입니다|합니다|됩니다|십시오)")  # 장별 문체가 섞이는 것을 막는다
-# 팀 완료 기준: 기술의 우열이나 단일 승자를 결정하지 않는다.
-# "단일 승자를 결정하지 않았다" 처럼 부정문에도 걸리는 낱말은 넣지 않는다 (오탐).
-RANKING = re.compile(r"(더 나은 선택|더 우수한|가장 우수|선택해야 한다|명백히 앞선|승자는)")
-MISSING_NOTE = "이 장을 작성할 자료가 확보되지 않았다. (NOT_VERIFIED)"
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROMPT_PATH = _ROOT / "prompts" / "report_generation.md"
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 목차
-#
-# points 의 각 원소는 (작성 항목, requires) 이다.
-#   requires = None        항상 쓴다
-#            = "a.b"       State 의 a.b 가 비어 있지 않을 때만 쓴다
-#            = ("a", "b")  둘 중 하나라도 있으면 쓴다
-# ──────────────────────────────────────────────────────────────────────
-
-def _trl_cell(row: dict) -> str:
-    """TRL 표시값. 상류가 구간([4, 6])으로 주기도 하고 단일값으로 주기도 한다."""
-    value = row.get("trl_range", row.get("trl_value"))
-    if isinstance(value, (list, tuple)) and len(value) == 2:
-        return f"{value[0]}~{value[1]}"
-    return "NOT_VERIFIED" if value in (None, "") else str(value)
-
-
-def _score_cell(row: dict) -> str:
-    """점수 표시값. 상류마다 score / total_score 로 이름이 다르다.
-
-    관점마다 척도가 달라 숫자만 나란히 놓으면 오독을 부른다.
-    상류가 score_scale 을 주면 `4.1 / 5` 처럼 척도를 함께 찍는다.
-    """
-    for key in ("score", "total_score"):
-        if row.get(key) is not None:
-            scale = row.get("score_scale")
-            return f"{row[key]} / {scale}" if scale else str(row[key])
-    return "NOT_VERIFIED"
-
-
-PERSPECTIVES = [                       # (표시명, State Key, 값 추출 함수)
-    ("기술 성숙도(TRL)", "trl_result", _trl_cell),
-    ("시장", "market_result", _score_cell),
-    ("이해관계자", "stakeholder_result", _score_cell),
-    ("도메인", "domain_result", _score_cell),
-]
-PERSPECTIVE_KEYS = [k for _, k, _ in PERSPECTIVES]
-RESULT_KEYS = ["technical_result", *PERSPECTIVE_KEYS]
-# technical_result 안에서 근거(source)가 붙는 항목들
-GROUNDED_FIELDS = ("mechanism", "scope", "claims", "measurements",
-                   "limits_explicit", "limits_implicit")
-
-SECTIONS = [
-    {
-        "id": "1",
-        "title": "분석 배경",
-        # technical_result 를 주면 배경 대신 기술 설명을 쓰게 되어 3장과 겹친다
-        "keys": ["background_facts", "selected_technologies", "target_domain"],
-        "points": [
-            ("KV cache 가 LLM 서빙에서 병목이 되는 구조적 이유", "background_facts"),
-            ("컨텍스트 길이 증가에 따른 메모리 요구량 추세 (수치가 있으면 기준 시점과 함께)",
-             "background_facts"),
-            ("SW 접근과 HW 접근을 함께 보아야 하는 이유", "background_facts"),
-            ("이 분석이 답하려는 질문 — 기술의 동작 원리나 성능은 여기서 다루지 않는다", None),
-        ],
-    },
-    {
-        "id": "2",
-        "title": "기술 선정",
-        "keys": ["selected_technologies", "background_facts", "technical_result"],
-        "points": [
-            ("선정한 SW / HW 기술 2건", "selected_technologies"),
-            ("각 기술을 선정한 이유 (background_facts 의 선정 근거를 그대로 활용할 것)",
-             "background_facts"),
-            # 기술명만으로는 이 이유를 쓸 수 없다. 배경이나 기술 내용이 있어야 한다
-            ("두 기술을 같은 평가 축에 놓는 것이 타당한 이유",
-             ("background_facts", "technical_result")),
-        ],
-    },
-    {
-        "id": "3",
-        "title": "기술 개요",
-        "keys": ["technical_result", "selected_technologies"],
-        "points": [
-            ("기술별 핵심 접근 방향과 동작 원리", "technical_result"),
-            ("보고된 성능 특성 (수치는 baseline 과 함께)", "technical_result"),
-            ("기술 자체의 한계점 — 분석의 한계가 아니라 기술의 한계를 쓴다", "technical_result"),
-            ("두 기술을 나란히 놓은 비교표", "technical_result"),
-        ],
-    },
-    {
-        "id": "4",
-        "title": "관점별 평가",
-        "keys": ["score_table", *PERSPECTIVE_KEYS, "target_domain"],
-        "points": [
-            ("참고 자료의 score_table 을 그대로 본문 맨 앞에 옮길 것 (숫자를 다시 쓰지 말 것)",
-             tuple(PERSPECTIVE_KEYS)),
-            ("기술 성숙도(TRL): 기술별 TRL 값의 판단 근거", "trl_result"),
-            ("시장 관점: 시장 규모, 채택 현황, 생태계", "market_result"),
-            ("이해관계자 관점: 경쟁사 / 도입기업 / 개발자 / 투자업계", "stakeholder_result"),
-            ("도메인 관점: target_domain 기준 적용 적합성", "domain_result"),
-        ],
-    },
-    {
-        "id": "5",
-        "title": "시사점",
-        # selected_technologies 가 없으면 LLM 이 기술명 약어를 임의로 풀어 쓴다
-        "keys": ["evaluation_result", "selected_technologies"],
-        # 불일치 의견은 건별로 항목을 펼친다. 한 줄 지시로는 LLM 이 일부만 쓴다
-        "expand": [("evaluation_result.disagreements",
-                    "엇갈리는 지점 {i}: 「{item}」 — 어느 관점이 왜 그렇게 보는지, "
-                    "이 엇갈림이 도입 판단에 어떤 의미인지 독립된 문단으로 서술할 것")],
-        "points": [
-            ("관점 간 일치 의견", "evaluation_result.agreements"),
-            ("trade-off 관계", "evaluation_result.tradeoffs"),
-            ("도입 조건별 시사점 (어느 쪽이 낫다가 아니라, 어떤 조건에서 어느 쪽이 맞는지)",
-             "evaluation_result.implications"),
-        ],
-    },
-    {
-        "id": "6",
-        "title": "한계점",
-        "keys": ["evidence_stats", "method_notes", "technical_result"],
-        "points": [
-            ("기술별로 확보한 근거의 수와 유형 차이에서 오는 정보 비대칭 "
-             "(evidence_stats 의 수치를 인용할 것)", "references"),
-            ("공개 정보 기반 추정이 적용된 범위와 해석상 주의점", "technical_result"),
-            ("확증편향을 줄이기 위해 실제로 취한 조치 — method_notes 에 있는 항목만 쓸 것. "
-             "하지 않은 조치를 지어내지 말 것", None),
-        ],
-    },
-]
-
-SECTION_BY_ID = {s["id"]: s for s in SECTIONS}
-BODY_IDS = [s["id"] for s in SECTIONS]
-REPORT_ORDER = ["summary"] + BODY_IDS
-HEADINGS = {"summary": "SUMMARY", "ref": "REFERENCE",
-            **{s["id"]: f"{s['id']}. {s['title']}" for s in SECTIONS}}
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 내부 State
-# ──────────────────────────────────────────────────────────────────────
-
-def _merge(left: dict, right: dict) -> dict:
-    """섹션 노드가 병렬로 쓰므로 합쳐야 한다. 없으면 InvalidUpdateError."""
-    return {**left, **right}
-
-
-class _ReportState(TypedDict, total=False):
-    """보고서 Agent 내부 전용. EvaluationState 를 오염시키지 않으려고 따로 둔다."""
-
-    # EvaluationState 에서 그대로 받는 입력
-    background_facts: dict[str, str]
-    selected_technologies: dict[str, str]
-    target_domain: str
-    technical_result: dict[str, Any]
-    trl_result: dict[str, Any]
-    market_result: dict[str, Any]
-    stakeholder_result: dict[str, Any]
-    domain_result: dict[str, Any]
-    evaluation_result: dict[str, list[str]]
-    references: list[dict[str, Any]]
-
-    # 작업 영역
-    source: dict[str, Any]       # 섹션 프롬프트에 주입할 자료 묶음
-    plan: dict[str, dict]        # 장별 {points, min_chars, keys} — 들어온 자료가 정한다
-    ref_index: dict[str, Any]    # 대표 id -> 출처
-    ref_alias: dict[str, str]    # 모든 id -> 대표 id
-    sections: Annotated[dict[str, str], _merge]
-    issues: list[dict[str, str]]
-    attempt: int
-    final_report: str
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 자료 유무 판정
-# ──────────────────────────────────────────────────────────────────────
-
-def _dig(state: dict, path: str) -> Any:
-    """'a.b' 형태의 경로로 State 안을 따라 들어간다. 없으면 None."""
-    cur: Any = state
-    for part in path.split("."):
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(part)
-        if cur is None or cur == "" or cur == [] or cur == {}:
-            return None
-    return cur
-
-
-def _has(state: dict, path: str) -> bool:
-    """State 에 이 경로의 자료가 실제로 들어왔는지.
-
-    None / 빈 문자열 / 빈 리스트 / 빈 dict 는 모두 "없음" 으로 본다.
-    값이 있으나 내용이 NOT_VERIFIED 인 경우는 "있음" 이다.
-    그 사실 자체가 한계점으로 서술할 가치가 있기 때문이다.
-    """
-    return _dig(state, path) is not None
-
-
-def _present(state: dict, requires) -> bool:
-    """작성 항목의 requires 를 판정한다. None 이면 항상 참, 튜플이면 하나만 있어도 참."""
-    if requires is None:
-        return True
-    if isinstance(requires, (tuple, list)):
-        return any(_has(state, p) for p in requires)
-    return _has(state, requires)
-
-
-_DERIVED = {"score_table", "evidence_stats", "method_notes", "citable_refs"}   # _prepare 가 만드는 자료
-
-
-def _expand_points(state: dict, section: dict) -> list[str]:
-    """리스트로 들어온 자료를 항목 하나씩으로 펼친다.
-
-    "불일치 의견을 빠뜨리지 마라" 라고 한 줄로 지시하면 LLM 은 긴 목록 중 일부만 쓴다.
-    항목 자체를 N개로 펼치면 누락이 구조적으로 어려워지고, 항목 수에 비례해 목표 분량도
-    같이 늘어난다.
-    """
-    points = []
-    for path, template in section.get("expand", []):
-        for i, item in enumerate(_dig(state, path) or [], 1):
-            points.append(template.format(i=i, item=str(item)[:150]))
-    return points
-
-
-def _build_plan(state: dict, source: dict) -> dict[str, dict]:
-    """들어온 자료를 보고 장별 작성 항목·목표 분량·주입할 자료를 정한다.
-
-    두 가지를 함께 줄여야 한다.
-
-    1. 자료가 없는 항목은 지시 자체를 하지 않는다. 쓰라고 시켜 놓고 자료를 안 주면
-       LLM 은 "자료 미확보" 라고 쓰거나 지어낸다.
-    2. 목표 분량도 **실제 주입되는 자료의 양** 을 넘지 않게 묶는다. 항목만 줄이고 분량을
-       그대로 두면 남은 자료로 분량을 채우려고 지어낸다 (기술명 2개만 주고 600자를 쓰라고
-       하면 없는 동작 원리를 만들어 낸다). 구조화된 자료를 문장으로 풀면 길어지는 것이
-       정상이므로 상한은 자료 글자수의 MAX_EXPANSION 배로 둔다.
-    3. 하한만 주면 남는 분량을 다른 장의 내용이나 지어낸 서술로 채우므로 상한도 함께 준다.
-    """
-    plan = {}
-    for section in SECTIONS:
-        points = _expand_points(state, section)
-        points += [text for text, req in section["points"] if _present(state, req)]
-        keys = [k for k in section["keys"] if k in _DERIVED or _has(state, k)]
-        if source.get("citable_refs"):
-            keys.append("citable_refs")   # 인용 가능한 id 목록은 모든 장에 넣는다
-        budget = len(json.dumps({k: source.get(k) for k in keys}, ensure_ascii=False))
-        low = max(MIN_CHARS, min(MAX_CHARS,
-                                 CHARS_PER_POINT * len(points),
-                                 int(budget * MAX_EXPANSION)))
-        # 상한이 없으면 남는 분량을 다른 장의 내용이나 지어낸 서술로 채운다
-        plan[section["id"]] = {"points": points, "keys": keys,
-                               "min_chars": low, "max_chars": int(low * 1.8)}
-    return plan
-
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 헬퍼
-# ──────────────────────────────────────────────────────────────────────
-
-_RULES: str | None = None
-
-
-def _load_rules() -> str:
-    """prompts/report_generation.md 를 읽어 모든 섹션 프롬프트 앞에 붙인다."""
-    global _RULES
-    if _RULES is None:
-        _RULES = _PROMPT_PATH.read_text(encoding="utf-8")
-    return _RULES
-
-
-def _tokenize(text: str) -> set[str]:
-    return {t.lower() for t in re.findall(r"[A-Za-z0-9]+|[가-힣]{2,}", text)}
-
-
-def _pick(container: dict, tech: str, role: str) -> dict:
-    """평가 결과에서 기술 하나의 행을 꺼낸다.
-
-    키를 기술명("ITME")으로 쓸지 역할("hw")로 쓸지가 팀에서 확정되지 않아 둘 다 받는다.
-    """
-    return (container or {}).get(tech) or (container or {}).get(role) or {}
-
-
-_ID_FIELDS = ("evidence_id", "id", "source_id", "chunk_id", "url", "source")
-
-
-def _evidence_id(value: Any) -> str | None:
-    """근거 1건에서 출처 id 를 뽑는다.
-
-    상류가 id 문자열을 주기도 하고(기술 조사·이해관계자) dict 를 주기도 한다.
-    시장 평가는 {source, url, as_of, unit, baseline, value}, 도메인 평가는
-    {criterion_id, criterion, source, quote} 형태다. dict 를 그대로 set 에 넣으면
-    TypeError 로 파이프라인 마지막 노드가 죽으므로 여기서 반드시 문자열로 만든다.
-    """
-    if isinstance(value, str):
-        return value or None
-    if isinstance(value, dict):
-        for field in _ID_FIELDS:
-            found = value.get(field)
-            if isinstance(found, str) and found:
-                return found
-    return None
-
-
-def _evidence_of(row: dict) -> list[str]:
-    """평가 행에 달린 출처 id. 상류마다 이름과 위치가 달라 모두 흡수한다.
-
-      - evidence / evidence_ids     : 평면 리스트 (문자열 또는 dict)
-      - criteria[].evidence_ids     : 이해관계자 평가의 세부 항목별 중첩
-      - components[].evidence       : TRL 평가의 구성요소별 중첩
-    """
-    raw = list(row.get("evidence") or row.get("evidence_ids") or [])
-    for nested in (row.get("criteria") or []) + (row.get("components") or []):
-        if not isinstance(nested, dict):
-            continue
-        value = nested.get("evidence_ids") or nested.get("evidence") or []
-        raw += value if isinstance(value, list) else [value]
-    return [eid for eid in (_evidence_id(v) for v in raw) if eid]
-
-
-def _host_of(url: str) -> str:
-    """URL 의 호스트. 웹 출처는 게시 주체가 곧 사이트이므로 기관명 자리에 쓴다.
-
-    없는 정보를 지어내는 것이 아니라 주어진 url 에서 유도하는 것이다.
-    """
-    if not isinstance(url, str) or "//" not in url:
-        return ""
-    return url.split("//", 1)[1].split("/", 1)[0].removeprefix("www.")
-
-
-def _kind_of(ref: dict) -> str:
-    """출처 유형. kind 를 안 주는 상류가 있어 url 이 있으면 웹 출처로 본다."""
-    return ref.get("kind") or ("web" if ref.get("url") else "미등록")
-
-
-def _format_reference(ref: dict) -> str:
-    """출처 1건을 제출 규정 표기 형식으로 만든다. LLM 이 쓰면 형식이 흔들려 코드가 찍는다.
-
-    상류 Agent 마다 필드가 달라 세 경우를 모두 받는다.
-      - citation 통문자열(기술 조사) → 그대로 쓰고 url 만 덧붙인다
-      - kind 별 구조화 필드          → 규정 형식으로 조립
-      - 필드가 모자란 경우           → 지어내지 않고 NOT_VERIFIED 로 남긴다
-    """
-    url = ref.get("url", "")
-    citation = (ref.get("citation") or "").strip()
-    if citation:                      # 기술 조사 출처는 이미 논문 표기 형식이다
-        return f"{citation} {url}".strip() if url and url not in citation else citation
-
-    kind = _kind_of(ref)
-    # 상류마다 이름이 다르다: 제목은 title/source, 날짜는 date/as_of, 매체는 venue/source_type.
-    # 없는 필드를 '미상' 으로 메우지 않고 NOT_VERIFIED 로 남겨 누락을 드러낸다.
-    host = _host_of(url)
-    authors = ref.get("authors") or host or "작성자 NOT_VERIFIED"
-    title = ref.get("title") or ref.get("source") or "제목 NOT_VERIFIED"
-    date = str(ref.get("date") or ref.get("as_of") or "NOT_VERIFIED")
-    venue = ref.get("venue") or ref.get("source_type") or host
-    locator = ref.get("locator", "")
-
-    if kind == "patent":
-        return f"{authors}({date}). {title}, {locator}, {url}"
-    if kind == "paper":
-        return f"{authors}({date[:4]}). {title}. {venue}, {locator}."
-    return f"{authors}({date}). {title}. {venue or '사이트명 NOT_VERIFIED'}, {url}"
-
-
-def _normalize_references(refs: list) -> tuple[dict, dict]:
-    """중복 등록된 출처를 url 기준으로 합친다.
-
-    기술 조사가 TECH-03 으로, 시장 평가가 MKT-07 로 같은 논문을 넣는 일이 반드시 생긴다.
-    먼저 나온 id 를 대표로 삼아 (대표 id -> 출처), (모든 id -> 대표 id) 두 표를 만든다.
-    id 가 없는 항목에는 임시 id 를 붙여 최소한 형식은 유지한다.
-    """
-    index, alias, by_url = {}, {}, {}
-    for n, ref in enumerate(refs or [], 1):
-        # 상류마다 id / evidence_id 로 이름이 다르고, 기술 조사 출처는 tech_id 로만 연결된다
-        rid = (ref.get("id") or ref.get("evidence_id")
-               or (f"PAPER-{ref['tech_id'].upper()}" if ref.get("tech_id") else f"AUTO-{n:02d}"))
-        key = (ref.get("url") or f"__{rid}").rstrip("/")
-        if rid in index:
-            # 같은 출처를 두 Agent 가 각자 등록한 경우다(예: 기술 조사와 도메인 평가의 동일 논문).
-            # 뒤에 온 것으로 덮어쓰면 citation 같은 알찬 필드를 잃으므로, 빈 칸만 채운다.
-            index[rid] = {**ref, **{k: v for k, v in index[rid].items() if v}}
-        elif key not in by_url:
-            by_url[key] = rid
-            index[rid] = ref
-        else:
-            rid = by_url[key]
-        alias[ref.get("id") or ref.get("evidence_id") or rid] = rid
-        # 시장·도메인 평가는 근거를 id 가 아니라 url 이나 청크로 가리킨다.
-        # 그 값들도 같은 출처를 향하도록 별칭을 걸어 둔다.
-        for field in ("url", "chunk_id", "evidence_id", "id"):
-            found = ref.get(field)
-            if isinstance(found, str) and found:
-                alias.setdefault(found, rid)
-        for chunk in ref.get("chunk_ids") or []:
-            if isinstance(chunk, str) and chunk:
-                alias.setdefault(chunk, rid)
-    return index, alias
-
-
-def _display_name(state: dict, tech: str) -> str:
-    """표시용 기술명.
-
-    selected_technologies 의 값이 tech_id("deepseek_v2_mla")로 바뀌어, 그대로 쓰면
-    표와 제목에 id 가 노출된다. 상류 결과가 들고 있는 표시명을 찾아 쓴다.
-    """
-    for key in RESULT_KEYS:
-        row = (state.get(key) or {}).get(tech) or {}
-        for field in ("title", "technology", "name"):
-            if row.get(field):
-                return row[field]
-    return tech
-
-
-def _score_table(state: dict) -> str:
-    """관점별 평가 비교표. 들어온 관점만 행으로 만든다.
-
-    LLM 에게 숫자를 쓰게 하면 반올림하거나 지어내므로 State 값을 그대로 찍는다.
-    """
-    tech = state.get("selected_technologies", {})
-    sw, hw = tech.get("sw", "SW"), tech.get("hw", "HW")
-    rows = [(label, key, cell) for label, key, cell in PERSPECTIVES if _has(state, key)]
-    if not rows:
-        return ""
-
-    lines = [f"| 관점 | {_display_name(state, sw)} | {_display_name(state, hw)} |", "|---|---|---|"]
-    for label, key, cell in rows:
-        cells = [cell(_pick(state[key], name, role))
-                 for name, role in ((sw, "sw"), (hw, "hw"))]
-        lines.append(f"| {label} | {cells[0]} | {cells[1]} |")
-    return "\n".join(lines)
-
-
-def _evidence_stats(state: dict, index: dict, alias: dict) -> dict:
-    """기술별로 확보된 근거의 수와 유형.
-
-    한계점 장에서 "SW 는 5건, HW 는 특허 1건뿐" 같은 정보 비대칭을 수치로 말하기 위한 근거다.
-    이 값이 있어야 한계점을 지어내지 않고 쓸 수 있다.
-    """
-    tech = state.get("selected_technologies", {})
-    stats = {}
-    for role in ("sw", "hw"):
-        tid = tech.get(role)
-        if not tid:
-            continue
-        ids = set()
-        for key in RESULT_KEYS:
-            ids.update(alias.get(e, e) for e in _evidence_of(_pick(state.get(key, {}), tid, role)))
-        kinds: dict[str, int] = {}
-        for e in ids:
-            k = _kind_of(index.get(e, {}))
-            kinds[k] = kinds.get(k, 0) + 1
-
-        entry = {"확보 근거 수": len(ids), "유형별": kinds}
-        profile = _pick(state.get("technical_result", {}), tid, role)
-        if profile:
-            # 원문에서 실제로 근거가 붙어 살아남은 항목 수. 정보 비대칭의 핵심 지표다
-            entry["원문 근거 항목 수"] = {f: len(profile.get(f) or []) for f in GROUNDED_FIELDS}
-            if profile.get("evidence_level"):
-                entry["근거 등급"] = profile["evidence_level"]
-            used = (profile.get("retrieval") or {}).get("chunks_used")
-            if used is not None:
-                entry["사용 청크 수"] = used
-        stats[_display_name(state, tid)] = entry
-    return stats
-
-
-def _method_notes(state: dict) -> list[str]:
-    """한계점 장에 쓸 수 있는 '실제로 취한 조치'.
-
-    파이프라인이 실제로 한 일만 담는다. 예를 들어 평가 관점이 하나만 들어왔다면
-    "독립 실행" 을 말할 수 없으므로 그 항목을 넣지 않는다.
-    프롬프트에서 "여기 없는 조치는 쓰지 마라" 로 묶어, 하지도 않은 조치를 주장하는 것을 막는다.
-    """
-    notes = []
-    done = [label for label, key, _ in PERSPECTIVES if _has(state, key)]
-    if len(done) >= 2:
-        notes.append(f"{' · '.join(done)} 평가는 서로의 결과를 참조하지 않고 병렬로 독립 실행되었다.")
-        notes.append(f"두 기술에 동일한 평가 축({' / '.join(done)})과 동일한 지시문을 적용했다.")
-        notes.append("관점별 비교표는 서술이 아니라 State 값에서 직접 렌더링해 수치 왜곡 가능성을 차단했다.")
-
-    n = len((state.get("evaluation_result") or {}).get("disagreements", []))
-    if n:
-        notes.append(f"평가 종합 단계에서 나온 불일치 의견 {n}건을 축약하지 않고 시사점 장에 명시했다.")
-    if state.get("references"):
-        notes.append("본문의 모든 인용을 references 에 등록된 id 와 자동 대조했고, 미등록 인용은 반려했다.")
-    notes.append("보고서 전 과정에서 기술의 우열이나 단일 승자를 결정하지 않았다.")
-    return notes
-
-
-def _section_prompt(section: dict, plan: dict, source: dict, extra: str = "") -> str:
-    """살아남은 작성 항목과 그 항목이 쓸 자료만 담은 프롬프트를 만든다.
-
-    필요한 State Key 는 SECTIONS 에 이미 적혀 있으므로 LLM 이 도구로 찾게 하지 않고
-    처음부터 넣어 준다 (LLM 호출 1회로 끝난다).
-    """
-    context = {k: source.get(k) for k in plan["keys"] if k != "citable_refs"}
-    points = "\n".join(f"- {p}" for p in plan["points"])
-    citable = "\n".join(f"- `{r['id']}` — {r['출처']}"
-                        for r in source.get("citable_refs") or []) or "- (확보된 출처 없음)"
-    return f"""{_load_rules()}
-
----
-
-## 작성할 섹션
-
-{section["id"]}. {section["title"]}
-
-## 반드시 다룰 항목
-
-아래 항목은 실제로 확보된 자료에 맞춰 추려진 것이다. 여기 없는 내용은 쓰지 않는다.
-
-{points}
-
-## 분량
-
-한글 {plan["min_chars"]}자 이상 {plan["max_chars"]}자 이하. 항목마다 근거와 해석을 함께 쓴다.
-위 항목에 해당하지 않는 내용으로 분량을 채우지 마라. 쓸 자료가 없으면 하한에 못 미쳐도 된다.
-
-## 인용 가능한 출처 id
-
-아래 목록의 id 만 `[ref:id]` 로 인용할 수 있다. 목록에 없는 id 는 최종 보고서에서
-삭제되므로, 자료의 키 이름이나 청크 식별자를 출처처럼 쓰지 마라.
-인용할 출처가 마땅치 않으면 출처 표기 없이 쓰거나 `NOT_VERIFIED` 로 남긴다.
-
-{citable}
-
-## 참고 자료
-
-아래 JSON 안에 있는 내용만 사용한다.
-
-```json
-{json.dumps(context, ensure_ascii=False, indent=2)}
-```
-{extra}
-장 제목 없이 본문만 마크다운으로 출력하라."""
-
-
-def _llm():
-    return init_chat_model(MODEL_NAME, temperature=0)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 노드
-# ──────────────────────────────────────────────────────────────────────
-
-def _adapt_upstream(state: dict, index: dict) -> tuple[dict, dict]:
-    """상류 Agent 출력 형식의 차이를 여기서 한 번만 흡수한다.
-
-    기술 조사 출처는 `tech_id` 로만 연결돼 있어 본문이 인용할 id 가 없다. 그래서
-
-      - 프로필에 `evidence` 를 달아 인용할 id 를 만들어 주고,
-      - 항목마다 붙은 `source.chunk_id` 를 그 논문 출처의 별칭으로 등록한다.
-
-    청크는 결국 그 논문의 일부이므로, LLM 이 [ref:dsv2-c04] 라고 써도 최종 REFERENCE 에서는
-    해당 논문 한 건으로 합쳐진다. 이렇게 흡수해 두면 이후 단계는 상류 형식을 몰라도 된다.
-    State 를 직접 고치지 않고 얕은 복사본과 별칭표를 돌려준다.
-    """
-    profiles, chunk_alias = {}, {}
-    for tid, profile in (state.get("technical_result") or {}).items():
-        paper_id = f"PAPER-{tid.upper()}"
-        if paper_id in index:
-            stripped = {}
-            for field in GROUNDED_FIELDS:
-                items = profile.get(field)
-                if not items:
-                    continue
-                for item in items:
-                    chunk_id = (item.get("source") or {}).get("chunk_id")
-                    if chunk_id:
-                        chunk_alias[chunk_id] = paper_id
-                # 청크 id 를 보여 주면 LLM 이 그것을 출처 id 로 인용하거나 없는 id 를 지어낸다.
-                # 보고서가 인용할 것은 논문이지 청크가 아니므로 주입 전에 떼어 낸다.
-                stripped[field] = [{k: v for k, v in item.items() if k != "source"}
-                                   for item in items]
-            profile = {**profile, **stripped, "evidence": _evidence_of(profile) or [paper_id]}
-        profiles[tid] = profile
-    adapted = {**state, "technical_result": profiles} if profiles else dict(state)
-    return adapted, chunk_alias
-
-
-def _prepare(state: _ReportState) -> dict:
-    """섹션 작성 전 준비. LLM 을 쓰지 않는다.
-
-    1. 중복 출처를 합쳐 ref_index / ref_alias 생성
-    2. LLM 에게 맡기면 안 되는 값을 미리 계산 (score_table, evidence_stats, method_notes)
-    3. 들어온 자료를 보고 장별 작성 계획(plan)을 세운다
-    """
-    index, alias = _normalize_references(state.get("references", []))
-    adapted, chunk_alias = _adapt_upstream(state, index)
-    alias.update(chunk_alias)      # [ref:청크id] 도 그 논문으로 이어 준다
-    source: dict[str, Any] = {
-        k: adapted.get(k) for k in
-        ["background_facts", "selected_technologies", "target_domain",
-         *RESULT_KEYS, "evaluation_result"]
-    }
-    source["score_table"] = _score_table(adapted)
-    source["evidence_stats"] = _evidence_stats(adapted, index, alias)
-    source["method_notes"] = _method_notes(adapted)
-    # 인용 가능한 id 를 명시적으로 주지 않으면 LLM 이 자료의 키 이름이나 청크 id 를 인용한다
-    source["citable_refs"] = [{"id": rid, "출처": _format_reference(ref)[:90]}
-                              for rid, ref in index.items()]
-    plan = _build_plan(adapted, source)
-
-    raw = len(state.get("references") or [])
-    print(f"[report] 출처 {raw}건 → {len(index)}건 (중복 제거)")
-    if raw and not any(r.get("id") for r in state["references"]):
-        print("[report] 경고: references 에 id 가 없다. 본문 인용을 출처와 연결할 수 없다.")
-    for sid in BODY_IDS:
-        p = plan[sid]
-        if not p["points"]:
-            print(f"[report] 계획 {HEADINGS[sid]}: 자료 없음 → 장 생략")
-        else:
-            print(f"[report] 계획 {HEADINGS[sid]}: 항목 {len(p['points'])}개, "
-                  f"분량 {p['min_chars']}~{p['max_chars']}자")
-
-    return {"source": source, "plan": plan, "ref_index": index, "ref_alias": alias,
-            "sections": {}, "attempt": 0}
-
-
-def _make_writer(section_id: str):
-    """장 하나를 쓰는 노드를 만든다. 본문 장들이 이 팩토리로 만들어져 병렬 실행된다."""
-
-    def write(state: _ReportState) -> dict:
-        section, plan = SECTION_BY_ID[section_id], state["plan"][section_id]
-        if not plan["points"]:
-            # 쓸 자료가 하나도 없다. LLM 을 부르면 지어낼 뿐이므로 부르지 않는다.
-            print(f"[report] {HEADINGS[section_id]} — 자료 미확보로 생략")
-            return {"sections": {section_id: MISSING_NOTE}}
-
-        draft = _llm().invoke(
-            [HumanMessage(content=_section_prompt(section, plan, state["source"]))]
-        ).content.strip()
-        print(f"[report] {HEADINGS[section_id]} — {len(draft)}자")
-        return {"sections": {section_id: draft}}
-
-    write.__name__ = f"section_{section_id}"
-    return write
-
-
-def _body_text(sections: dict) -> str:
-    return "\n\n".join(f"## {HEADINGS[sid]}\n\n{sections[sid]}"
-                       for sid in BODY_IDS if sections.get(sid))
-
-
-def _write_summary(state: _ReportState) -> dict:
-    """SUMMARY. 개요가 아니라 결론 요약이라 본문이 다 나온 뒤에 쓴다."""
-    draft = _llm().invoke([HumanMessage(content=f"""{_load_rules()}
-
----
-
-아래는 이 보고서의 본문이다. 맨 앞에 놓일 SUMMARY 를 작성하라.
-
-- {SUMMARY_MAX_CHARS}자 이내. 개요 장표가 아니라 평가 결론의 요약이다.
-- 본문에 실제로 서술된 내용만 요약한다. 자료가 없어 생략된 장은 언급하지 않는다.
-- 본문의 [ref:...] 인용 표기는 그대로 유지하라.
-- 장 제목 없이 본문만 출력하라.
-
-{_body_text(state["sections"])}""")]).content.strip()
-    print(f"[report] SUMMARY — {len(draft)}자")
-    return {"sections": {"summary": draft}}
-
-
-def _validate(state: _ReportState) -> dict:
-    """완성본을 기계적으로 검사한다. LLM 을 쓰지 않는다.
-
-    자료가 없어 생략된 장은 분량·문체 검사를 건너뛴다. 검사 항목은 다음과 같다.
-
-    1. 분량 미달 / 초과                        → 얇아지거나 다른 장을 침범하는 것을 막는다
-    2. 존댓말 종결                             → 장별로 문체가 섞이는 것을 막는다
-    3. 우열 판정 표현                          → 팀 완료 기준 위반
-    4. references 에 없는 출처 인용            → 환각 인용
-    4. SUMMARY 분량 초과
-    5. 시사점 장이 disagreements 를 빠뜨림     → 엇갈림을 뭉개는 것을 막는다
-    6. 관점별 평가의 점수가 score_table 과 불일치 → 수치 환각
-    """
-    issues: list[dict[str, str]] = []
-    sections, index, alias = state["sections"], state["ref_index"], state["ref_alias"]
-    plan = state["plan"]
-    written = {sid: t for sid, t in sections.items() if t != MISSING_NOTE}
-
-    for sid in BODY_IDS:
-        if sections.get(sid) == MISSING_NOTE:
-            continue
-        text, goal = (sections.get(sid) or "").strip(), plan[sid]["min_chars"]
-        if not text:
-            issues.append({"section": sid, "problem": "본문이 비어 있다"})
-        elif len(text) < goal * MIN_RATIO:
-            issues.append({"section": sid, "problem":
-                           f"분량이 {len(text)}자로 목표 {goal}자에 크게 못 미친다. "
-                           f"항목마다 근거와 해석을 덧붙여 더 구체적으로 쓰라"})
-        elif len(text) > plan[sid]["max_chars"]:
-            issues.append({"section": sid, "problem":
-                           f"분량이 {len(text)}자로 상한 {plan[sid]['max_chars']}자를 넘었다. "
-                           f"이 장의 작성 항목에 해당하지 않는 서술을 덜어내라"})
-
-    for sid, text in written.items():
-        polite = len(HONORIFIC.findall(text))
-        if polite:
-            issues.append({"section": sid, "problem":
-                           f"존댓말 종결이 {polite}곳 있다. 문체를 평서체 '~다' 로 통일하라"})
-
-        ranked = RANKING.findall(text)
-        if ranked:
-            issues.append({"section": sid, "problem":
-                           f"우열을 판정하는 표현이 있다: {', '.join(sorted(set(ranked)))}. "
-                           f"조건에 따라 어느 쪽이 맞는지로 바꿔 쓰라"})
-
-        unknown = sorted({c for c in CITE.findall(text) if alias.get(c, c) not in index})
-        if unknown:
-            issues.append({"section": sid, "problem":
-                           f"references 에 없는 출처를 인용했다: {', '.join(unknown)}"})
-
-    if len(sections.get("summary", "")) > SUMMARY_MAX_CHARS:
-        issues.append({"section": "summary",
-                       "problem": f"SUMMARY 가 {SUMMARY_MAX_CHARS}자를 넘었다"})
-
-    disagreements = (state.get("evaluation_result") or {}).get("disagreements", [])
-    if disagreements and "5" in written:
-        body = _tokenize(written["5"])
-        covered = sum(1 for d in disagreements
-                      if len(_tokenize(d) & body) >= max(2, len(_tokenize(d)) // 3))
-        if covered < len(disagreements):
-            issues.append({"section": "5", "problem":
-                           f"불일치 의견 {len(disagreements)}건 중 {covered}건만 반영됐다. "
-                           f"누락된 항목을 모두 서술하라"})
-
-    table = state["source"]["score_table"]
-    if table and "4" in written:
-        values = [c.strip() for row in table.splitlines()[2:] for c in row.split("|")[2:4]]
-        missing = [v for v in values if v not in ("NOT_VERIFIED", "") and v not in written["4"]]
-        if missing:
-            issues.append({"section": "4", "problem":
-                           f"비교표 값 {', '.join(missing)} 이 본문에 없다. "
-                           f"참고 자료의 score_table 표를 그대로 옮겨라"})
-
-    print(f"[report] 검증: 문제 {len(issues)}건")
-    for i in issues:
-        print(f"         [{i['section']}] {i['problem']}")
-    return {"issues": issues, "attempt": state.get("attempt", 0) + 1}
-
-
-def _route(state: _ReportState) -> Literal["revise", "render"]:
-    """문제가 남았으면 revise, 아니면 render.
-
-    MAX_REVISION 을 넘기면 문제를 안은 채 render 로 보낸다.
-    보고서가 아예 안 나오는 것보다 낫고, 남은 문제는 로그에 찍혀 있다.
-    """
-    if not state["issues"]:
-        return "render"
-    if state["attempt"] >= MAX_REVISION:
-        print("[report] 재작성 상한 도달 — 남은 문제를 안고 출력한다")
-        return "render"
-    return "revise"
-
-
-def _revise(state: _ReportState) -> dict:
-    """지적된 장만 다시 쓴다. 통과한 장은 그대로 둔다."""
-    fixed: dict[str, str] = {}
-    for issue in state["issues"]:
-        sid = issue["section"]
-        if sid == "summary":
-            merged = {**state["sections"], **fixed}
-            fixed.update(_write_summary({**state, "sections": merged})["sections"])
-            continue
-        prompt = _section_prompt(
-            SECTION_BY_ID[sid], state["plan"][sid], state["source"],
-            extra=f"\n## 재작성 사유\n\n{issue['problem']}\n\n"
-                  f"## 이전 초안\n\n{state['sections'].get(sid, '')}\n",
-        )
-        fixed[sid] = _llm().invoke([HumanMessage(content=prompt)]).content.strip()
-        print(f"[report] {HEADINGS[sid]} 재작성 — {len(fixed[sid])}자")
-    return {"sections": fixed}
-
-
-def _render(state: _ReportState) -> dict:
-    """최종 마크다운 조립. LLM 을 쓰지 않는다.
-
-    본문의 [ref:id] 를 등장 순서대로 [1], [2] ... 로 바꾸고, 그렇게 실제로 인용된
-    출처만 REFERENCE 에 싣는다. "실제 사용한 출처만 포함한다" 가 자동으로 지켜진다.
-    """
-    sections, index, alias = state["sections"], state["ref_index"], state["ref_alias"]
-    body = "\n\n".join(f"## {HEADINGS[sid]}\n\n{(sections.get(sid) or '').strip()}"
-                       for sid in REPORT_ORDER)
-
-    order: list[str] = []
-    number: dict[str, int] = {}
-
-    def renumber(match: re.Match) -> str:
-        rid = alias.get(match.group(1), match.group(1))
-        if rid not in number:
-            if rid not in index:          # validate 가 놓친 경우의 방어선
-                return ""
-            order.append(rid)
-            number[rid] = len(order)
-        return f"[{number[rid]}]"
-
-    body = CITE.sub(renumber, body)
-    refs = "\n".join(f"[{i}] {_format_reference(index[rid])}"
-                     for i, rid in enumerate(order, 1)) or "본문에서 인용한 자료가 없다."
-
-    tech = state.get("selected_technologies", {})
-    sw, hw = tech.get("sw"), tech.get("hw")
-    header = (f"# KV Cache 최적화 기술 다관점 평가 보고서\n\n"
-              f"**대상 기술** SW: {_display_name(state, sw) if sw else '-'} / "
-              f"HW: {_display_name(state, hw) if hw else '-'}　·　"
-              f"**적용 도메인** {state.get('target_domain', '-')}")
-
-    print(f"[report] 렌더링: 인용 {len(order)}건 → REFERENCE {len(order)}건")
-    return {"final_report": f"{header}\n\n{body}\n\n## {HEADINGS['ref']}\n\n{refs}\n"}
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 그래프 / 진입점
-# ──────────────────────────────────────────────────────────────────────
-
-_GRAPH = None
-
-
-def _build_graph():
-    """보고서 내부 그래프. 여러 번 호출돼도 한 번만 컴파일한다."""
-    global _GRAPH
-    if _GRAPH is not None:
-        return _GRAPH
-
-    wf = StateGraph(_ReportState)
-    wf.add_node("prepare", _prepare)
-    for sid in BODY_IDS:
-        wf.add_node(f"section_{sid}", _make_writer(sid))
-    wf.add_node("summary", _write_summary)
-    wf.add_node("validate", _validate)
-    wf.add_node("revise", _revise)
-    wf.add_node("render", _render)
-
-    wf.add_edge(START, "prepare")
-    for sid in BODY_IDS:
-        wf.add_edge("prepare", f"section_{sid}")                    # 병렬 fan-out
-    wf.add_edge([f"section_{sid}" for sid in BODY_IDS], "summary")  # 전부 끝나야 SUMMARY
-    wf.add_edge("summary", "validate")
-    wf.add_conditional_edges("validate", _route,
-                             {"revise": "revise", "render": "render"})
-    wf.add_edge("revise", "validate")
-    wf.add_edge("render", END)
-
-    _GRAPH = wf.compile()
-    return _GRAPH
+MODEL_NAME = "gpt-4o-mini"
+SECTIONS = (
+    ("1. 분석 배경", "자료에 나타난 분석 목적과 배경"),
+    ("2. 기술 선정", "실제로 선정된 기술과 자료에 명시된 선정 이유"),
+    ("3. 기술 개요", "기술별 동작 원리, 성능, 적용 범위와 제약"),
+    ("4. 관점별 평가", "실제 확보된 관점별 평가와 근거, 점수와 척도"),
+    ("5. 시사점", "평가 간 일치와 불일치, 이득과 비용, 적용 조건"),
+    ("6. 한계점", "근거 공백, 불확실성, 누락되거나 실패한 단계"),
+    ("REFERENCE", "입력에 실제로 있는 출처 정보와 인용 연결"),
+)
+
+
+def _generate(rules: str, request: str) -> str:
+    llm = init_chat_model(
+        MODEL_NAME, model_provider="openai", temperature=0, timeout=90, max_retries=1,
+    )
+    text = response_text(llm.invoke([
+        SystemMessage(content=rules), HumanMessage(content=request),
+    ]))
+    if not text:
+        raise ValueError("보고서 응답이 비어 있습니다.")
+    return text
+
+
+def _write_section(section, rules: str, material: str):
+    title, subject = section
+    try:
+        text = _generate(rules, (
+            f"작성할 장: {title}\n주제: {subject}\n"
+            "전체 입력에서 이 장에 관련된 내용을 직접 찾아 연결하라. "
+            "장 제목 없이 본문만 작성하라.\n\n확보된 입력 자료:\n" + material
+        ))
+        print(f"[report] {title} — {len(text)}자")
+        return title, text, None
+    except Exception as exc:
+        error = error_record(f"report/{title}", exc)
+        return title, "이 장의 자동 작성에 실패했다. 확보된 자료는 부록에 보존했다.", error
 
 
 def report_generation_agent(state: EvaluationState) -> dict:
-    """전체 State를 최종 다관점 평가 보고서로 구성한다."""
-    result = _build_graph().invoke(dict(state))
-    return {"final_report": result["final_report"]}
+    """자유 형식의 평가 결과를 받아 가능한 장을 끝까지 작성한다."""
+    errors = []
+    try:
+        rules = _PROMPT_PATH.read_text(encoding="utf-8")
+        material = dump_data(source_data(state))
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            sections = list(pool.map(
+                lambda section: _write_section(section, rules, material), SECTIONS,
+            ))
+        errors = [error for _, _, error in sections if error]
+        body = "\n\n".join(f"## {title}\n\n{text}" for title, text, _ in sections)
+        try:
+            summary = _generate(rules, (
+                "아래 완성된 본문을 한국어 900자 이내로 요약하라. "
+                "실패한 장이 있으면 부분 결과임을 명시하라. 제목 없이 본문만 작성하라.\n\n" + body
+            ))
+        except Exception as exc:
+            errors.append(error_record("report/SUMMARY", exc))
+            summary = "자동 요약에 실패했다. 아래 본문에 작성 가능한 결과를 수록했다."
+        report = f"# 기술 다관점 평가 보고서\n\n## SUMMARY\n\n{summary}\n\n{body}\n"
+        if errors or state.get("run_errors"):
+            report += source_appendix({**state, "report_errors": errors})
+        return {"final_report": report, "run_errors": errors}
+    except Exception as exc:
+        errors.append(error_record("report_generation", exc))
+        return {
+            "final_report": fallback_report(
+                {**state, "report_errors": errors}, "보고서 자동 작성을 완료하지 못했다.",
+            ),
+            "run_errors": errors,
+        }
 
 
 if __name__ == "__main__":
-    # 다른 Agent 없이 이 Agent 만 단독 실행한다.
-    #   python -m agents.report_generation [state.json] [out.md]
     import sys
 
     from dotenv import load_dotenv
 
     load_dotenv(_ROOT / ".env", override=True)
-
     src = Path(sys.argv[1]) if len(sys.argv) > 1 else _ROOT / "data" / "sample_state.json"
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else _ROOT / "outputs" / "final_report.md"
+    import json
 
     report = report_generation_agent(json.loads(src.read_text(encoding="utf-8")))["final_report"]
+    dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[report] 저장: {dst}")

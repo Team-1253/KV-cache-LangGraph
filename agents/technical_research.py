@@ -332,7 +332,8 @@ def technical_research_agent(state: EvaluationState) -> dict:
             },
         }
         references.append(
-            {"tech_id": tid, "kind": "paper", "citation": meta["citation"], "url": meta["url"]}
+            {"id": f"PAPER-{tid.upper()}", "tech_id": tid, "kind": "paper",
+             "citation": meta["citation"], "url": meta["url"]}
         )
         print(
             f"  근거 청크 {len(docs)}개 · 추출 {counts} · "

@@ -15,6 +15,7 @@ class EvaluationState(TypedDict, total=False):
     stakeholder_result: dict[str, Any]
     domain_result: dict[str, Any]
 
-    evaluation_result: dict[str, list[str]]
+    evaluation_result: Any
+    run_errors: Annotated[list[dict[str, str]], operator.add]
     references: Annotated[list[dict[str, Any]], operator.add]
     final_report: str
