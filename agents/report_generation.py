@@ -72,10 +72,15 @@ def _trl_cell(row: dict) -> str:
 
 
 def _score_cell(row: dict) -> str:
-    """점수 표시값. 상류마다 score / total_score 로 이름이 다르다."""
+    """점수 표시값. 상류마다 score / total_score 로 이름이 다르다.
+
+    관점마다 척도가 달라 숫자만 나란히 놓으면 오독을 부른다.
+    상류가 score_scale 을 주면 `4.1 / 5` 처럼 척도를 함께 찍는다.
+    """
     for key in ("score", "total_score"):
         if row.get(key) is not None:
-            return str(row[key])
+            scale = row.get("score_scale")
+            return f"{row[key]} / {scale}" if scale else str(row[key])
     return "NOT_VERIFIED"
 
 
@@ -324,18 +329,51 @@ def _pick(container: dict, tech: str, role: str) -> dict:
     return (container or {}).get(tech) or (container or {}).get(role) or {}
 
 
-def _evidence_of(row: dict) -> list:
+_ID_FIELDS = ("evidence_id", "id", "source_id", "chunk_id", "url", "source")
+
+
+def _evidence_id(value: Any) -> str | None:
+    """근거 1건에서 출처 id 를 뽑는다.
+
+    상류가 id 문자열을 주기도 하고(기술 조사·이해관계자) dict 를 주기도 한다.
+    시장 평가는 {source, url, as_of, unit, baseline, value}, 도메인 평가는
+    {criterion_id, criterion, source, quote} 형태다. dict 를 그대로 set 에 넣으면
+    TypeError 로 파이프라인 마지막 노드가 죽으므로 여기서 반드시 문자열로 만든다.
+    """
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, dict):
+        for field in _ID_FIELDS:
+            found = value.get(field)
+            if isinstance(found, str) and found:
+                return found
+    return None
+
+
+def _evidence_of(row: dict) -> list[str]:
     """평가 행에 달린 출처 id. 상류마다 이름과 위치가 달라 모두 흡수한다.
 
-      - evidence / evidence_ids     : 평면 리스트
+      - evidence / evidence_ids     : 평면 리스트 (문자열 또는 dict)
       - criteria[].evidence_ids     : 이해관계자 평가의 세부 항목별 중첩
       - components[].evidence       : TRL 평가의 구성요소별 중첩
     """
-    ids = list(row.get("evidence") or row.get("evidence_ids") or [])
+    raw = list(row.get("evidence") or row.get("evidence_ids") or [])
     for nested in (row.get("criteria") or []) + (row.get("components") or []):
+        if not isinstance(nested, dict):
+            continue
         value = nested.get("evidence_ids") or nested.get("evidence") or []
-        ids += value if isinstance(value, list) else [value]
-    return ids
+        raw += value if isinstance(value, list) else [value]
+    return [eid for eid in (_evidence_id(v) for v in raw) if eid]
+
+
+def _host_of(url: str) -> str:
+    """URL 의 호스트. 웹 출처는 게시 주체가 곧 사이트이므로 기관명 자리에 쓴다.
+
+    없는 정보를 지어내는 것이 아니라 주어진 url 에서 유도하는 것이다.
+    """
+    if not isinstance(url, str) or "//" not in url:
+        return ""
+    return url.split("//", 1)[1].split("/", 1)[0].removeprefix("www.")
 
 
 def _kind_of(ref: dict) -> str:
@@ -357,11 +395,14 @@ def _format_reference(ref: dict) -> str:
         return f"{citation} {url}".strip() if url and url not in citation else citation
 
     kind = _kind_of(ref)
-    # 없는 필드를 '미상' 으로 메우지 않고 NOT_VERIFIED 로 남겨 누락을 드러낸다
-    authors = ref.get("authors") or ref.get("technology") or "작성자 NOT_VERIFIED"
-    title = ref.get("title") or "제목 NOT_VERIFIED"
-    date = str(ref.get("date") or "NOT_VERIFIED")
-    venue, locator = ref.get("venue", ""), ref.get("locator", "")
+    # 상류마다 이름이 다르다: 제목은 title/source, 날짜는 date/as_of, 매체는 venue/source_type.
+    # 없는 필드를 '미상' 으로 메우지 않고 NOT_VERIFIED 로 남겨 누락을 드러낸다.
+    host = _host_of(url)
+    authors = ref.get("authors") or host or "작성자 NOT_VERIFIED"
+    title = ref.get("title") or ref.get("source") or "제목 NOT_VERIFIED"
+    date = str(ref.get("date") or ref.get("as_of") or "NOT_VERIFIED")
+    venue = ref.get("venue") or ref.get("source_type") or host
+    locator = ref.get("locator", "")
 
     if kind == "patent":
         return f"{authors}({date}). {title}, {locator}, {url}"
@@ -383,10 +424,25 @@ def _normalize_references(refs: list) -> tuple[dict, dict]:
         rid = (ref.get("id") or ref.get("evidence_id")
                or (f"PAPER-{ref['tech_id'].upper()}" if ref.get("tech_id") else f"AUTO-{n:02d}"))
         key = (ref.get("url") or f"__{rid}").rstrip("/")
-        if key not in by_url:
+        if rid in index:
+            # 같은 출처를 두 Agent 가 각자 등록한 경우다(예: 기술 조사와 도메인 평가의 동일 논문).
+            # 뒤에 온 것으로 덮어쓰면 citation 같은 알찬 필드를 잃으므로, 빈 칸만 채운다.
+            index[rid] = {**ref, **{k: v for k, v in index[rid].items() if v}}
+        elif key not in by_url:
             by_url[key] = rid
             index[rid] = ref
-        alias[rid] = by_url[key]
+        else:
+            rid = by_url[key]
+        alias[ref.get("id") or ref.get("evidence_id") or rid] = rid
+        # 시장·도메인 평가는 근거를 id 가 아니라 url 이나 청크로 가리킨다.
+        # 그 값들도 같은 출처를 향하도록 별칭을 걸어 둔다.
+        for field in ("url", "chunk_id", "evidence_id", "id"):
+            found = ref.get(field)
+            if isinstance(found, str) and found:
+                alias.setdefault(found, rid)
+        for chunk in ref.get("chunk_ids") or []:
+            if isinstance(chunk, str) and chunk:
+                alias.setdefault(chunk, rid)
     return index, alias
 
 
