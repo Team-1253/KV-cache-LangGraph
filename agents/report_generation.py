@@ -63,14 +63,33 @@ _PROMPT_PATH = _ROOT / "prompts" / "report_generation.md"
 #            = ("a", "b")  둘 중 하나라도 있으면 쓴다
 # ──────────────────────────────────────────────────────────────────────
 
-PERSPECTIVES = [                       # (표시명, State Key, 값 필드)
-    ("기술 성숙도(TRL)", "trl_result", "trl_value"),
-    ("시장", "market_result", "score"),
-    ("이해관계자", "stakeholder_result", "score"),
-    ("도메인", "domain_result", "score"),
+def _trl_cell(row: dict) -> str:
+    """TRL 표시값. 상류가 구간([4, 6])으로 주기도 하고 단일값으로 주기도 한다."""
+    value = row.get("trl_range", row.get("trl_value"))
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return f"{value[0]}~{value[1]}"
+    return "NOT_VERIFIED" if value in (None, "") else str(value)
+
+
+def _score_cell(row: dict) -> str:
+    """점수 표시값. 상류마다 score / total_score 로 이름이 다르다."""
+    for key in ("score", "total_score"):
+        if row.get(key) is not None:
+            return str(row[key])
+    return "NOT_VERIFIED"
+
+
+PERSPECTIVES = [                       # (표시명, State Key, 값 추출 함수)
+    ("기술 성숙도(TRL)", "trl_result", _trl_cell),
+    ("시장", "market_result", _score_cell),
+    ("이해관계자", "stakeholder_result", _score_cell),
+    ("도메인", "domain_result", _score_cell),
 ]
 PERSPECTIVE_KEYS = [k for _, k, _ in PERSPECTIVES]
 RESULT_KEYS = ["technical_result", *PERSPECTIVE_KEYS]
+# technical_result 안에서 근거(source)가 붙는 항목들
+GROUNDED_FIELDS = ("mechanism", "scope", "claims", "measurements",
+                   "limits_explicit", "limits_implicit")
 
 SECTIONS = [
     {
@@ -230,7 +249,7 @@ def _present(state: dict, requires) -> bool:
     return _has(state, requires)
 
 
-_DERIVED = {"score_table", "evidence_stats", "method_notes"}   # _prepare 가 만드는 자료
+_DERIVED = {"score_table", "evidence_stats", "method_notes", "citable_refs"}   # _prepare 가 만드는 자료
 
 
 def _expand_points(state: dict, section: dict) -> list[str]:
@@ -265,6 +284,8 @@ def _build_plan(state: dict, source: dict) -> dict[str, dict]:
         points = _expand_points(state, section)
         points += [text for text, req in section["points"] if _present(state, req)]
         keys = [k for k in section["keys"] if k in _DERIVED or _has(state, k)]
+        if source.get("citable_refs"):
+            keys.append("citable_refs")   # 인용 가능한 id 목록은 모든 장에 넣는다
         budget = len(json.dumps({k: source.get(k) for k in keys}, ensure_ascii=False))
         low = max(MIN_CHARS, min(MAX_CHARS,
                                  CHARS_PER_POINT * len(points),
@@ -304,22 +325,49 @@ def _pick(container: dict, tech: str, role: str) -> dict:
 
 
 def _evidence_of(row: dict) -> list:
-    """평가 행에 달린 출처 id. 키 이름이 evidence / evidence_ids 로 흔들려서 둘 다 본다."""
-    return row.get("evidence") or row.get("evidence_ids") or []
+    """평가 행에 달린 출처 id. 상류마다 이름과 위치가 달라 모두 흡수한다.
+
+      - evidence / evidence_ids     : 평면 리스트
+      - criteria[].evidence_ids     : 이해관계자 평가의 세부 항목별 중첩
+      - components[].evidence       : TRL 평가의 구성요소별 중첩
+    """
+    ids = list(row.get("evidence") or row.get("evidence_ids") or [])
+    for nested in (row.get("criteria") or []) + (row.get("components") or []):
+        value = nested.get("evidence_ids") or nested.get("evidence") or []
+        ids += value if isinstance(value, list) else [value]
+    return ids
+
+
+def _kind_of(ref: dict) -> str:
+    """출처 유형. kind 를 안 주는 상류가 있어 url 이 있으면 웹 출처로 본다."""
+    return ref.get("kind") or ("web" if ref.get("url") else "미등록")
 
 
 def _format_reference(ref: dict) -> str:
-    """출처 1건을 제출 규정 표기 형식으로 만든다. LLM 이 쓰면 형식이 흔들려 코드가 찍는다."""
-    kind = ref.get("kind", "web")
-    authors, title = ref.get("authors", "미상"), ref.get("title", "제목 미상")
-    date, venue = str(ref.get("date", "n.d.")), ref.get("venue", "")
-    locator, url = ref.get("locator", ""), ref.get("url", "")
+    """출처 1건을 제출 규정 표기 형식으로 만든다. LLM 이 쓰면 형식이 흔들려 코드가 찍는다.
+
+    상류 Agent 마다 필드가 달라 세 경우를 모두 받는다.
+      - citation 통문자열(기술 조사) → 그대로 쓰고 url 만 덧붙인다
+      - kind 별 구조화 필드          → 규정 형식으로 조립
+      - 필드가 모자란 경우           → 지어내지 않고 NOT_VERIFIED 로 남긴다
+    """
+    url = ref.get("url", "")
+    citation = (ref.get("citation") or "").strip()
+    if citation:                      # 기술 조사 출처는 이미 논문 표기 형식이다
+        return f"{citation} {url}".strip() if url and url not in citation else citation
+
+    kind = _kind_of(ref)
+    # 없는 필드를 '미상' 으로 메우지 않고 NOT_VERIFIED 로 남겨 누락을 드러낸다
+    authors = ref.get("authors") or ref.get("technology") or "작성자 NOT_VERIFIED"
+    title = ref.get("title") or "제목 NOT_VERIFIED"
+    date = str(ref.get("date") or "NOT_VERIFIED")
+    venue, locator = ref.get("venue", ""), ref.get("locator", "")
 
     if kind == "patent":
         return f"{authors}({date}). {title}, {locator}, {url}"
     if kind == "paper":
         return f"{authors}({date[:4]}). {title}. {venue}, {locator}."
-    return f"{authors}({date}). {title}. {venue}, {url}"
+    return f"{authors}({date}). {title}. {venue or '사이트명 NOT_VERIFIED'}, {url}"
 
 
 def _normalize_references(refs: list) -> tuple[dict, dict]:
@@ -331,13 +379,29 @@ def _normalize_references(refs: list) -> tuple[dict, dict]:
     """
     index, alias, by_url = {}, {}, {}
     for n, ref in enumerate(refs or [], 1):
-        rid = ref.get("id") or f"AUTO-{n:02d}"
+        # 상류마다 id / evidence_id 로 이름이 다르고, 기술 조사 출처는 tech_id 로만 연결된다
+        rid = (ref.get("id") or ref.get("evidence_id")
+               or (f"PAPER-{ref['tech_id'].upper()}" if ref.get("tech_id") else f"AUTO-{n:02d}"))
         key = (ref.get("url") or f"__{rid}").rstrip("/")
         if key not in by_url:
             by_url[key] = rid
             index[rid] = ref
         alias[rid] = by_url[key]
     return index, alias
+
+
+def _display_name(state: dict, tech: str) -> str:
+    """표시용 기술명.
+
+    selected_technologies 의 값이 tech_id("deepseek_v2_mla")로 바뀌어, 그대로 쓰면
+    표와 제목에 id 가 노출된다. 상류 결과가 들고 있는 표시명을 찾아 쓴다.
+    """
+    for key in RESULT_KEYS:
+        row = (state.get(key) or {}).get(tech) or {}
+        for field in ("title", "technology", "name"):
+            if row.get(field):
+                return row[field]
+    return tech
 
 
 def _score_table(state: dict) -> str:
@@ -347,13 +411,13 @@ def _score_table(state: dict) -> str:
     """
     tech = state.get("selected_technologies", {})
     sw, hw = tech.get("sw", "SW"), tech.get("hw", "HW")
-    rows = [(label, key, field) for label, key, field in PERSPECTIVES if _has(state, key)]
+    rows = [(label, key, cell) for label, key, cell in PERSPECTIVES if _has(state, key)]
     if not rows:
         return ""
 
-    lines = [f"| 관점 | {sw} | {hw} |", "|---|---|---|"]
-    for label, key, field in rows:
-        cells = [str(_pick(state[key], name, role).get(field, "NOT_VERIFIED"))
+    lines = [f"| 관점 | {_display_name(state, sw)} | {_display_name(state, hw)} |", "|---|---|---|"]
+    for label, key, cell in rows:
+        cells = [cell(_pick(state[key], name, role))
                  for name, role in ((sw, "sw"), (hw, "hw"))]
         lines.append(f"| {label} | {cells[0]} | {cells[1]} |")
     return "\n".join(lines)
@@ -368,17 +432,28 @@ def _evidence_stats(state: dict, index: dict, alias: dict) -> dict:
     tech = state.get("selected_technologies", {})
     stats = {}
     for role in ("sw", "hw"):
-        name = tech.get(role)
-        if not name:
+        tid = tech.get(role)
+        if not tid:
             continue
         ids = set()
         for key in RESULT_KEYS:
-            ids.update(alias.get(e, e) for e in _evidence_of(_pick(state.get(key, {}), name, role)))
+            ids.update(alias.get(e, e) for e in _evidence_of(_pick(state.get(key, {}), tid, role)))
         kinds: dict[str, int] = {}
         for e in ids:
-            k = index.get(e, {}).get("kind", "미등록")
+            k = _kind_of(index.get(e, {}))
             kinds[k] = kinds.get(k, 0) + 1
-        stats[name] = {"확보 근거 수": len(ids), "유형별": kinds}
+
+        entry = {"확보 근거 수": len(ids), "유형별": kinds}
+        profile = _pick(state.get("technical_result", {}), tid, role)
+        if profile:
+            # 원문에서 실제로 근거가 붙어 살아남은 항목 수. 정보 비대칭의 핵심 지표다
+            entry["원문 근거 항목 수"] = {f: len(profile.get(f) or []) for f in GROUNDED_FIELDS}
+            if profile.get("evidence_level"):
+                entry["근거 등급"] = profile["evidence_level"]
+            used = (profile.get("retrieval") or {}).get("chunks_used")
+            if used is not None:
+                entry["사용 청크 수"] = used
+        stats[_display_name(state, tid)] = entry
     return stats
 
 
@@ -411,8 +486,10 @@ def _section_prompt(section: dict, plan: dict, source: dict, extra: str = "") ->
     필요한 State Key 는 SECTIONS 에 이미 적혀 있으므로 LLM 이 도구로 찾게 하지 않고
     처음부터 넣어 준다 (LLM 호출 1회로 끝난다).
     """
-    context = {k: source.get(k) for k in plan["keys"]}
+    context = {k: source.get(k) for k in plan["keys"] if k != "citable_refs"}
     points = "\n".join(f"- {p}" for p in plan["points"])
+    citable = "\n".join(f"- `{r['id']}` — {r['출처']}"
+                        for r in source.get("citable_refs") or []) or "- (확보된 출처 없음)"
     return f"""{_load_rules()}
 
 ---
@@ -431,6 +508,14 @@ def _section_prompt(section: dict, plan: dict, source: dict, extra: str = "") ->
 
 한글 {plan["min_chars"]}자 이상 {plan["max_chars"]}자 이하. 항목마다 근거와 해석을 함께 쓴다.
 위 항목에 해당하지 않는 내용으로 분량을 채우지 마라. 쓸 자료가 없으면 하한에 못 미쳐도 된다.
+
+## 인용 가능한 출처 id
+
+아래 목록의 id 만 `[ref:id]` 로 인용할 수 있다. 목록에 없는 id 는 최종 보고서에서
+삭제되므로, 자료의 키 이름이나 청크 식별자를 출처처럼 쓰지 마라.
+인용할 출처가 마땅치 않으면 출처 표기 없이 쓰거나 `NOT_VERIFIED` 로 남긴다.
+
+{citable}
 
 ## 참고 자료
 
@@ -451,6 +536,41 @@ def _llm():
 # 노드
 # ──────────────────────────────────────────────────────────────────────
 
+def _adapt_upstream(state: dict, index: dict) -> tuple[dict, dict]:
+    """상류 Agent 출력 형식의 차이를 여기서 한 번만 흡수한다.
+
+    기술 조사 출처는 `tech_id` 로만 연결돼 있어 본문이 인용할 id 가 없다. 그래서
+
+      - 프로필에 `evidence` 를 달아 인용할 id 를 만들어 주고,
+      - 항목마다 붙은 `source.chunk_id` 를 그 논문 출처의 별칭으로 등록한다.
+
+    청크는 결국 그 논문의 일부이므로, LLM 이 [ref:dsv2-c04] 라고 써도 최종 REFERENCE 에서는
+    해당 논문 한 건으로 합쳐진다. 이렇게 흡수해 두면 이후 단계는 상류 형식을 몰라도 된다.
+    State 를 직접 고치지 않고 얕은 복사본과 별칭표를 돌려준다.
+    """
+    profiles, chunk_alias = {}, {}
+    for tid, profile in (state.get("technical_result") or {}).items():
+        paper_id = f"PAPER-{tid.upper()}"
+        if paper_id in index:
+            stripped = {}
+            for field in GROUNDED_FIELDS:
+                items = profile.get(field)
+                if not items:
+                    continue
+                for item in items:
+                    chunk_id = (item.get("source") or {}).get("chunk_id")
+                    if chunk_id:
+                        chunk_alias[chunk_id] = paper_id
+                # 청크 id 를 보여 주면 LLM 이 그것을 출처 id 로 인용하거나 없는 id 를 지어낸다.
+                # 보고서가 인용할 것은 논문이지 청크가 아니므로 주입 전에 떼어 낸다.
+                stripped[field] = [{k: v for k, v in item.items() if k != "source"}
+                                   for item in items]
+            profile = {**profile, **stripped, "evidence": _evidence_of(profile) or [paper_id]}
+        profiles[tid] = profile
+    adapted = {**state, "technical_result": profiles} if profiles else dict(state)
+    return adapted, chunk_alias
+
+
 def _prepare(state: _ReportState) -> dict:
     """섹션 작성 전 준비. LLM 을 쓰지 않는다.
 
@@ -459,15 +579,20 @@ def _prepare(state: _ReportState) -> dict:
     3. 들어온 자료를 보고 장별 작성 계획(plan)을 세운다
     """
     index, alias = _normalize_references(state.get("references", []))
+    adapted, chunk_alias = _adapt_upstream(state, index)
+    alias.update(chunk_alias)      # [ref:청크id] 도 그 논문으로 이어 준다
     source: dict[str, Any] = {
-        k: state.get(k) for k in
+        k: adapted.get(k) for k in
         ["background_facts", "selected_technologies", "target_domain",
          *RESULT_KEYS, "evaluation_result"]
     }
-    source["score_table"] = _score_table(state)
-    source["evidence_stats"] = _evidence_stats(state, index, alias)
-    source["method_notes"] = _method_notes(state)
-    plan = _build_plan(state, source)
+    source["score_table"] = _score_table(adapted)
+    source["evidence_stats"] = _evidence_stats(adapted, index, alias)
+    source["method_notes"] = _method_notes(adapted)
+    # 인용 가능한 id 를 명시적으로 주지 않으면 LLM 이 자료의 키 이름이나 청크 id 를 인용한다
+    source["citable_refs"] = [{"id": rid, "출처": _format_reference(ref)[:90]}
+                              for rid, ref in index.items()]
+    plan = _build_plan(adapted, source)
 
     raw = len(state.get("references") or [])
     print(f"[report] 출처 {raw}건 → {len(index)}건 (중복 제거)")
@@ -667,8 +792,10 @@ def _render(state: _ReportState) -> dict:
                      for i, rid in enumerate(order, 1)) or "본문에서 인용한 자료가 없다."
 
     tech = state.get("selected_technologies", {})
+    sw, hw = tech.get("sw"), tech.get("hw")
     header = (f"# KV Cache 최적화 기술 다관점 평가 보고서\n\n"
-              f"**대상 기술** SW: {tech.get('sw', '-')} / HW: {tech.get('hw', '-')}　·　"
+              f"**대상 기술** SW: {_display_name(state, sw) if sw else '-'} / "
+              f"HW: {_display_name(state, hw) if hw else '-'}　·　"
               f"**적용 도메인** {state.get('target_domain', '-')}")
 
     print(f"[report] 렌더링: 인용 {len(order)}건 → REFERENCE {len(order)}건")
