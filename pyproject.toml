@@ -40,3 +40,12 @@ dependencies = [
     "ragas>=0.4.3",
     "langgraph-swarm>=0.1.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
