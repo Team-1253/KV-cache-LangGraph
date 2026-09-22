@@ -11,18 +11,19 @@ LangGraph 서브그래프가 담당한다.
 from __future__ import annotations
 
 import json
+import operator
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 from urllib.parse import urlparse
 
 from langgraph.errors import NodeError
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, RetryPolicy
+from langgraph.types import Command, RetryPolicy, Send
 from pydantic import BaseModel, Field
 
 from agents.state import EvaluationState
@@ -668,6 +669,112 @@ def _resolve_technologies(state: EvaluationState) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Pipeline graph (Send map-reduce over technologies × criteria)
+# --------------------------------------------------------------------------- #
+def _merge_items(
+    left: dict[str, dict] | None, right: dict[str, dict] | None
+) -> dict[str, dict]:
+    """`tech_id → {item_id: item}` 를 병합한다(Send map 결과 취합)."""
+    merged: dict[str, dict] = {k: dict(v) for k, v in (left or {}).items()}
+    for tech_id, items in (right or {}).items():
+        merged.setdefault(tech_id, {}).update(items)
+    return merged
+
+
+class PipelineState(TypedDict):
+    technologies: list[dict]
+    criteria: list[dict]
+    as_of: str
+    items: Annotated[dict[str, dict], _merge_items]
+    references: Annotated[list[dict], operator.add]
+    market_result: dict[str, dict]
+
+
+def _dispatch_items(state: PipelineState) -> list[Send]:
+    """(기술 × 항목) 조합마다 `item` 노드로 fan-out 한다."""
+    sends: list[Send] = []
+    for tech in state.get("technologies", []):
+        for criterion in state.get("criteria", []):
+            sends.append(
+                Send(
+                    "item",
+                    {
+                        "tech_id": tech["tech_id"],
+                        "technology": tech["title"],
+                        "profile": tech["profile"],
+                        "criterion": criterion,
+                    },
+                )
+            )
+    return sends
+
+
+def _item_node(item_graph) -> Callable[[dict], dict]:
+    def node(payload: dict) -> dict:
+        criterion = payload["criterion"]
+        tech_id = payload["tech_id"]
+        final = item_graph.invoke(
+            {
+                "criterion": criterion,
+                "technology": payload["technology"],
+                "tech_info": payload["profile"],
+                "attempt": 0,
+            }
+        )
+        item = {
+            "item": criterion["id"],
+            "score": final.get("score", 0),
+            "confidence_tag": final.get("confidence_tag", TAG_NOT_VERIFIED),
+            "rationale": final.get("rationale", ""),
+            "sources": final.get("sources", []),
+            "evidence": final.get("evidence", []),
+            "source_refs": final.get("source_refs", []),
+            "attempts": final.get("attempt", 0),
+        }
+        return {
+            "items": {tech_id: {criterion["id"]: item}},
+            "references": _to_references(tech_id, {criterion["id"]: item}),
+        }
+
+    return node
+
+
+def _assemble_node() -> Callable[[PipelineState], dict]:
+    def node(state: PipelineState) -> dict:
+        items_by_tech = state.get("items", {}) or {}
+        criteria = state.get("criteria", [])
+        market_result: dict[str, dict] = {}
+        for tech in state.get("technologies", []):
+            tech_items = items_by_tech.get(tech["tech_id"], {})
+            market_result[tech["key"]] = {
+                "technology": tech["title"],
+                "tech_id": tech["tech_id"],
+                "camp": tech["camp"],
+                "score": _total_score(tech_items, criteria),
+                "rationale": _overall_rationale(tech["title"], tech_items),
+                "evidence": [
+                    ev for item in tech_items.values() for ev in item.get("evidence", [])
+                ],
+                "items": tech_items,
+            }
+        return {"market_result": market_result}
+
+    return node
+
+
+def build_pipeline_graph(deps: MarketDeps, system_prompt: str):
+    """기술·항목 fan-out(`Send` map) → 취합 → 시장 결과 조립 그래프."""
+    item_graph = build_item_graph(deps, system_prompt)
+    graph = StateGraph(PipelineState)
+    graph.add_node("item", _item_node(item_graph))
+    graph.add_node("assemble", _assemble_node())
+    graph.add_conditional_edges(START, _dispatch_items)
+    graph.add_edge("item", "assemble")
+    graph.add_edge("assemble", END)
+    return graph.compile()
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 def run_market_evaluation(
@@ -680,55 +787,24 @@ def run_market_evaluation(
     criteria = list(criteria if criteria is not None else rubric.get("criteria", []))
     eval_as_of = _eval_as_of()
 
-    graph = build_item_graph(deps, system_prompt)
-
-    market_result: dict[str, dict] = {}
-    references: list[dict] = []
-
-    for tech in _resolve_technologies(state):
-        key = tech["key"]
-        technology = tech["title"]
-        tech_info = tech["profile"]
-        items: dict[str, dict] = {}
-        for criterion in criteria:
-            final = graph.invoke(
-                {
-                    "criterion": criterion,
-                    "technology": technology,
-                    "tech_info": tech_info,
-                    "attempt": 0,
-                }
-            )
-            items[criterion["id"]] = {
-                "item": criterion["id"],
-                "score": final.get("score", 0),
-                "confidence_tag": final.get("confidence_tag", TAG_NOT_VERIFIED),
-                "rationale": final.get("rationale", ""),
-                "sources": final.get("sources", []),
-                "evidence": final.get("evidence", []),
-                "source_refs": final.get("source_refs", []),
-                "attempts": final.get("attempt", 0),
-            }
-
-        market_result[key] = {
-            "technology": technology,
-            "tech_id": tech["tech_id"],
-            "camp": tech["camp"],
-            "score": _total_score(items, criteria),
-            "rationale": _overall_rationale(technology, items),
-            "evidence": [
-                ev for item in items.values() for ev in item.get("evidence", [])
-            ],
-            "items": items,
+    pipeline = build_pipeline_graph(deps, system_prompt)
+    final = pipeline.invoke(
+        {
+            "technologies": _resolve_technologies(state),
+            "criteria": criteria,
+            "as_of": eval_as_of,
+            "items": {},
+            "references": [],
         }
-        references.extend(_to_references(key, items))
+    )
 
+    references = final.get("references", []) or []
     for reference in references:
         if not reference.get("as_of"):
             reference["as_of"] = eval_as_of
 
     return {
-        "market_result": market_result,
+        "market_result": final.get("market_result", {}),
         "references": _dedupe_references(references),
     }
 
