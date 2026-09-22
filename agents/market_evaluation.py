@@ -416,9 +416,9 @@ def _overall_rationale(technology: str, items: dict[str, dict]) -> str:
 def _resolve_technologies(state: EvaluationState) -> list[dict]:
     """`technical_result`(TechProfile)를 소비해 평가 대상 목록을 만든다.
 
-    `technical_result`는 `tech_id`("deepseek_v2_mla" | "itme")를 키로 사용하므로,
-    각 프로필의 `camp`(SW/HW)를 이용해 결과 키를 `sw`/`hw`로 정규화한다. 기술 조사
-    산출물이 없으면 `selected_technologies`로 폴백한다.
+    `technical_result`와 동일하게 `tech_id`("deepseek_v2_mla" | "itme")를 결과 키로
+    사용해 하류 Node와 키 체계를 통일한다. 기술 조사 산출물이 없으면
+    `selected_technologies`로 폴백한다(이 경우 키는 그대로 사용).
     """
     technical_result = state.get("technical_result", {}) or {}
     selected = state.get("selected_technologies", {}) or {}
@@ -426,14 +426,15 @@ def _resolve_technologies(state: EvaluationState) -> list[dict]:
     if isinstance(technical_result, dict) and technical_result:
         for tech_id, profile in technical_result.items():
             profile = profile if isinstance(profile, dict) else {}
-            camp = str(profile.get("camp", "")).lower()
-            key = camp if camp in ("sw", "hw") else tech_id
+            camp = profile.get("camp", "")
             resolved.append(
                 {
                     "tech_id": tech_id,
-                    "camp": profile.get("camp", ""),
-                    "key": key,
-                    "title": profile.get("title") or selected.get(key) or tech_id,
+                    "camp": camp,
+                    "key": tech_id,
+                    "title": profile.get("title")
+                    or selected.get(str(camp).lower())
+                    or tech_id,
                     "profile": profile,
                 }
             )
