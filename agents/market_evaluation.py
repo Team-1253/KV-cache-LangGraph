@@ -746,10 +746,14 @@ def _chat_model():
 
 
 @lru_cache(maxsize=1)
-def _tavily_client():
-    from tavily import TavilyClient
+def _tavily_wrapper():
+    """LangChain Tavily 통합 래퍼(원시 검색 결과 dict 반환)."""
+    from langchain_tavily import TavilySearchAPIWrapper
 
-    return TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    return TavilySearchAPIWrapper(
+        tavily_api_key=os.environ["TAVILY_API_KEY"],
+        api_base_url=os.getenv("TAVILY_BASE_URL") or None,
+    )
 
 
 def default_web_search(
@@ -761,24 +765,38 @@ def default_web_search(
     include_domains: list[str] | None = None,
     include_domains_mode: str | None = None,
 ) -> list[dict]:
-    client = _tavily_client()
+    """`langchain_tavily.TavilySearchAPIWrapper.raw_results`로 검색한다.
+
+    `raw_results`는 명명 파라미터를 모두 요구하므로 미사용 값은 None으로 채운다.
+    `include_domains_mode`·`chunks_per_source`·`include_published_date`는 `**kwargs`로
+    전달되어 Tavily 요청 본문에 병합된다.
+    """
+    wrapper = _tavily_wrapper()
     params: dict = {
         "query": query,
-        "topic": topic,
-        "search_depth": depth,
         "max_results": max_results,
-        "chunks_per_source": int(os.getenv("TAVILY_CHUNKS_PER_SOURCE", "3")),
-        "include_published_date": _bool_env("TAVILY_INCLUDE_PUBLISHED_DATE", True),
+        "search_depth": depth,
+        "include_domains": include_domains,
+        "exclude_domains": None,
         "include_answer": False,
         "include_raw_content": False,
+        "include_images": None,
+        "include_image_descriptions": None,
+        "include_favicon": None,
+        "topic": topic,
+        "time_range": None,
+        "country": None,
+        "auto_parameters": None,
+        "start_date": None,
+        "end_date": None,
         "include_usage": True,
-        "timeout": _float_env("TAVILY_TIMEOUT_SECONDS", 60.0),
+        "exact_match": None,
+        "chunks_per_source": int(os.getenv("TAVILY_CHUNKS_PER_SOURCE", "3")),
+        "include_published_date": _bool_env("TAVILY_INCLUDE_PUBLISHED_DATE", True),
     }
-    if include_domains:
-        params["include_domains"] = include_domains
-        if include_domains_mode:
-            params["include_domains_mode"] = include_domains_mode
-    response = client.search(**params)
+    if include_domains_mode:
+        params["include_domains_mode"] = include_domains_mode
+    response = wrapper.raw_results(**params)
     return response.get("results", [])
 
 
