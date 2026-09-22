@@ -16,6 +16,7 @@ from agents.market_evaluation import (
     EvidenceJudgement,
     MarketDeps,
     RubricScore,
+    load_rubric,
     map_tag,
     run_market_evaluation,
 )
@@ -280,6 +281,15 @@ def test_fallback_to_selected_technologies():
     assert set(out["market_result"].keys()) == {"sw", "hw"}
     assert out["market_result"]["sw"]["tech_id"] == "sw"
     assert out["market_result"]["sw"]["camp"] == ""
+
+
+def test_criteria_filter_limits_items():
+    only_a = [c for c in load_rubric()["criteria"] if c["id"] == "3-2-a"]
+    deps, *_ = make_deps([_result()], [4], rubric_score=4)
+    out = run_market_evaluation(make_state(), deps, only_a)
+    assert list(out["market_result"]["deepseek_v2_mla"]["items"].keys()) == ["3-2-a"]
+    # 1개 항목 x 5점 기준 -> 4 / 5 * 100
+    assert out["market_result"]["deepseek_v2_mla"]["score"] == pytest.approx(80.0)
 
 
 def test_partial_search_failure_is_tolerated():
