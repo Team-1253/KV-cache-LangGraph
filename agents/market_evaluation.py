@@ -449,10 +449,14 @@ def _resolve_technologies(state: EvaluationState) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
+def run_market_evaluation(
+    state: EvaluationState,
+    deps: MarketDeps,
+    criteria: list[dict] | None = None,
+) -> dict:
     rubric = load_rubric()
     system_prompt = load_system_prompt()
-    criteria = rubric.get("criteria", [])
+    criteria = list(criteria if criteria is not None else rubric.get("criteria", []))
     eval_as_of = _eval_as_of()
 
     graph = build_item_graph(deps, system_prompt)
