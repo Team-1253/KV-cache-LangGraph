@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
@@ -240,7 +241,11 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
                 "evidence": [],
             }
         scored = deps.score_rubric(
-            system_prompt, state["criterion"], state["technology"], results, evidence_score
+            system_prompt,
+            state["criterion"],
+            state["technology"],
+            results,
+            evidence_score,
         )
         return {
             "score": int(scored.score),
@@ -309,11 +314,23 @@ def _evidence_from_results(results: list[dict]) -> list[dict]:
 
 def _source_type(url: str) -> str:
     host = url.lower()
-    if any(domain in host for domain in ("arxiv.org", "acm.org", "ieee.org", "usenix.org", "openreview.net")):
+    if any(
+        domain in host
+        for domain in (
+            "arxiv.org",
+            "acm.org",
+            "ieee.org",
+            "usenix.org",
+            "openreview.net",
+        )
+    ):
         return "peer_review"
     if any(domain in host for domain in ("github.com", "huggingface.co", "docs.")):
         return "official"
-    if any(domain in host for domain in ("reddit.com", "news.ycombinator.com", "medium.com")):
+    if any(
+        domain in host
+        for domain in ("reddit.com", "news.ycombinator.com", "medium.com")
+    ):
         return "community"
     return "unknown"
 
@@ -353,7 +370,9 @@ def _total_score(items: dict[str, dict], criteria: list[dict]) -> float:
     denominator = len(criteria) * 5
     if not denominator:
         return 0.0
-    return round(sum(item.get("score", 1) for item in items.values()) / denominator * 100, 2)
+    return round(
+        sum(item.get("score", 1) for item in items.values()) / denominator * 100, 2
+    )
 
 
 def _overall_rationale(technology: str, items: dict[str, dict]) -> str:
@@ -382,7 +401,9 @@ def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
     references: list[dict] = []
 
     for key, technology in technologies.items():
-        tech_info = technical_result.get(key, {}) if isinstance(technical_result, dict) else {}
+        tech_info = (
+            technical_result.get(key, {}) if isinstance(technical_result, dict) else {}
+        )
         items: dict[str, dict] = {}
         for criterion in criteria:
             final = graph.invoke(
@@ -407,7 +428,9 @@ def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
             "technology": technology,
             "score": _total_score(items, criteria),
             "rationale": _overall_rationale(technology, items),
-            "evidence": [ev for item in items.values() for ev in item.get("evidence", [])],
+            "evidence": [
+                ev for item in items.values() for ev in item.get("evidence", [])
+            ],
             "items": items,
         }
         references.extend(_to_references(key, items))
@@ -416,7 +439,10 @@ def run_market_evaluation(state: EvaluationState, deps: MarketDeps) -> dict:
         if not reference.get("as_of"):
             reference["as_of"] = eval_as_of
 
-    return {"market_result": market_result, "references": _dedupe_references(references)}
+    return {
+        "market_result": market_result,
+        "references": _dedupe_references(references),
+    }
 
 
 def market_evaluation_agent(state: EvaluationState) -> dict:
@@ -486,7 +512,9 @@ def default_judge_evidence(
         f"검색 결과:\n{_format_results(results)}\n\n"
         "위 결과의 근거 품질을 0~5로 판정해 evidence_score와 reason을 반환하라."
     )
-    return model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user)])
+    return model.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user)]
+    )
 
 
 def default_score_rubric(
@@ -511,7 +539,9 @@ def default_score_rubric(
         f"확정된 검색 결과:\n{_format_results(results)}\n\n"
         "위 근거에 따라 score(1~5)와 rationale을 반환하라."
     )
-    return model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user)])
+    return model.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user)]
+    )
 
 
 def default_deps() -> MarketDeps:
