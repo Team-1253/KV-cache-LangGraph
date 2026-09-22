@@ -198,9 +198,24 @@ def test_no_results_is_not_verified():
     item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
     assert item["attempts"] == MAX_ATTEMPTS
     assert item["confidence_tag"] == TAG_NOT_VERIFIED
-    assert item["score"] == 1
+    assert item["score"] == 0
     assert judge.total_calls == 0
     assert scorer.calls == 0
+    # NOT_VERIFIED는 총점에 0점으로 반영된다.
+    assert out["market_result"]["deepseek_v2_mla"]["score"] == 0.0
+
+
+def test_scoring_failure_scores_zero():
+    class FailingScorer:
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("scoring unavailable")
+
+    deps = MarketDeps(FakeSearch([_result()]), PerKeyJudge([4]), FailingScorer())
+    out = run_market_evaluation(make_state(), deps)
+
+    item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
+    assert item["score"] == 0
+    assert item["confidence_tag"] == TAG_NOT_VERIFIED
 
 
 def test_weak_kept_when_sources_exist():
@@ -210,7 +225,7 @@ def test_weak_kept_when_sources_exist():
     item = out["market_result"]["deepseek_v2_mla"]["items"]["3-2-a"]
     assert item["attempts"] == MAX_ATTEMPTS
     assert item["confidence_tag"] == TAG_WEAK
-    assert item["score"] == 3  # from fake scorer, not forced to 1
+    assert item["score"] == 3  # from fake scorer, not forced to 0
     assert scorer.calls == 8
 
 
