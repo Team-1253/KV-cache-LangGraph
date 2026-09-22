@@ -146,7 +146,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=True)
     args = parse_args()
 
     state: EvaluationState = (
