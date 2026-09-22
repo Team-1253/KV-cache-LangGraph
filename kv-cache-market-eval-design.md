@@ -33,11 +33,12 @@ KV cache 최적화 기술(SW 압축 vs HW 메모리 접근)을 LangGraph 기반 
 
 ## 4. Evaluation Rubric (시장성 관점, E1~E4)
 
-> 아래 E1~E4는 룰브릭 JSON(`data/3-2_market_evaluation.json`)의 `3-2-a`~`3-2-d`에 대응한다. 구현·출력에서는 `3-2-a`~`3-2-d`를 사용한다.
+> 아래 E1~E4는 루브릭 JSON(`data/3-2_market_evaluation.json`)의 `3-2-a`~`3-2-d`에 대응한다. 구현·출력에서는 `3-2-a`~`3-2-d`를 사용한다.
 
 **배점 및 환산 규칙**
 - 4개 항목을 1~5점으로 평가하며 동일 비중으로 반영한다.
-- `100점 환산 총점 = 획득 점수 합계 ÷ 20 × 100`
+- `100점 환산 총점 = 획득 점수 합계 ÷ 20 × 100` (분모 20은 고정)
+- `NOT_VERIFIED`·채점 불가 항목은 **0점**으로 반영한다(분모는 유지).
 - 4개 항목은 모두 적용 대상이며, 항목별 조사가 끝난 상태를 전제로 하므로 적용 제외 항목은 두지 않는다.
 
 ### E1. 시장이 이 기술의 문제 영역을 크고 빠르게 성장하는 영역으로 보는가?
@@ -126,7 +127,7 @@ KV cache 최적화 기술(SW 압축 vs HW 메모리 접근)을 LangGraph 기반 
 
 ### NOT_VERIFIED 처리
 
-- `NOT_VERIFIED`: 항목은 적용 가능하지만 충분히 조사한 뒤에도 근거를 확인하지 못했을 때 사용한다. 이 경우 Evaluation Rubric 점수는 1점으로 처리한다.
+- `NOT_VERIFIED`: 항목은 적용 가능하지만 충분히 조사한 뒤에도 근거를 확인하지 못했을 때 사용한다. 이 경우 Evaluation Rubric 점수 기여는 0점으로 처리한다.
 - 출처를 찾지 못한 경우에도 항목을 제외하지 않고 `NOT_VERIFIED`로 기록한다.
 
 ### 신뢰도 태그 환산
@@ -136,7 +137,7 @@ KV cache 최적화 기술(SW 압축 vs HW 메모리 접근)을 LangGraph 기반 
 | 5 | 강함 |
 | 3~4 | 보통 |
 | 1~2 | 약함 |
-| NOT_VERIFIED | (Evaluation Rubric 1점 처리, 태그도 NOT_VERIFIED로 기록) |
+| NOT_VERIFIED | (Evaluation Rubric 0점 처리, 태그도 NOT_VERIFIED로 기록) |
 
 ---
 
@@ -164,13 +165,13 @@ graph TD
 ### 단계별 설명
 
 1. **입력**: 기술 조사 에이전트가 넘긴 개요·범위·한계 + 평가 범위 전제("데이터센터·클라우드 서빙 기준 시장")를 시스템 프롬프트에 고정 주입한다.
-2. **항목 순회**: `3-2-a`(시장 규모·성장) → `3-2-b`(비용·성능 효과) → `3-2-c`(채택·상용화) → `3-2-d`(생태계 지지) 순서로 처리한다. 각 항목은 기술 alias + 항목별 영문 시장 키워드 + 룰브릭 `evidence` + TechProfile 용어를 시드로 쿼리를 만든다. 재시도(2회차 이상)는 `advanced` 정밀도와 시장분석 도메인 `prefer`를 적용한다.
+2. **항목 순회**: `3-2-a`(시장 규모·성장) → `3-2-b`(비용·성능 효과) → `3-2-c`(채택·상용화) → `3-2-d`(생태계 지지) 순서로 처리한다. 각 항목은 기술 alias + 항목별 영문 시장 키워드 + 루브릭 `evidence` + TechProfile 용어를 시드로 쿼리를 만든다. 재시도(2회차 이상)는 `advanced` 정밀도와 시장분석 도메인 `prefer`를 적용한다.
 3. **RAG 검색**: Doc Pool에서 관련 청크를 우선 검색하고(기술 조사 에이전트와 임베딩 모델 공유), TAM·CAGR·채택 사례처럼 Pool에 없는 시장 데이터는 웹검색으로 보강한다.
 4. **Evidence Policy 판정 = 종료 조건**: 검색 결과를 Evidence Policy 표(5/4/3/2/1)로 채점한다.
    - 3점 이상 → 해당 항목 검색 종료, 근거 확정
    - 2점 이하이고 시도 3회 미만 → 쿼리를 다르게 재구성해 재검색
    - 3회 시도 후에도 2점 이하 → NOT_VERIFIED로 확정하고 다음 항목으로 이동 (무한 루프 방지)
-5. **Evaluation Rubric 채점**: 확정된 근거(또는 NOT_VERIFIED)를 바탕으로 해당 항목의 1~5점 기준표에 맞춰 점수와 판단 근거 요약을 생성한다. NOT_VERIFIED면 자동 1점 처리한다.
+5. **Evaluation Rubric 채점**: 확정된 근거(또는 NOT_VERIFIED)를 바탕으로 해당 항목의 1~5점 기준표에 맞춰 점수와 판단 근거 요약을 생성한다. NOT_VERIFIED·채점 불가면 0점 처리한다.
 6. **결과 저장**: 항목마다 `{item, score, evidence_score, confidence_tag, sources[], rationale}` 구조로 남긴다.
 7. **4항목 완료 후 조립**: 기술 1건의 총점(`획득 점수 합계÷20×100`)과 항목별 상세를 `market_eval` 객체로 묶는다.
 8. **State 저장**: SW·HW 기술을 앵커링 방지 목적으로 각각 독립 평가하되, 노드는 `app.py`에서 한 번만 호출되므로 내부에서 두 기술을 순회한다. 결과는 단일 키 `market_result = {"sw": {...}, "hw": {...}}`에 담아 평가 종합 에이전트가 나란히 비교할 수 있게 한다. (구체 형태는 §8 제안사항 참고)
@@ -184,7 +185,7 @@ graph TD
     "E1": {"score": 4, "evidence_score": 5, "confidence_tag": "강함", "sources": ["..."], "rationale": "..."},
     "E2": {"score": 3, "evidence_score": 2, "confidence_tag": "약함", "sources": ["..."], "rationale": "..."},
     "E3": {"score": 4, "evidence_score": 4, "confidence_tag": "보통", "sources": ["..."], "rationale": "..."},
-    "E4": {"score": 1, "evidence_score": null, "confidence_tag": "NOT_VERIFIED", "sources": [], "rationale": "..."},
+    "E4": {"score": 0, "evidence_score": null, "confidence_tag": "NOT_VERIFIED", "sources": [], "rationale": "..."},
     "total_100": 60
   }
 }
@@ -253,7 +254,7 @@ graph TD
 
 ### 7.4 Evidence 1점과 NOT_VERIFIED 우선순위 (제안)
 
-- 검색 후 **출처를 전혀 찾지 못함** → `NOT_VERIFIED` (Rubric 1점 처리, Evidence 태그도 `NOT_VERIFIED`)
+- 검색 후 **출처를 전혀 찾지 못함** → `NOT_VERIFIED` (Rubric 0점 처리, Evidence 태그도 `NOT_VERIFIED`)
 - 출처는 있으나 **신뢰성·독립성이 낮음** → Evidence 2점 (NOT_VERIFIED 아님)
 
 즉 Evidence 1점은 "출처 없음", `NOT_VERIFIED`는 "조사 완료 후 근거 미확인"으로 우선순위를 한 방향으로 고정한다.
