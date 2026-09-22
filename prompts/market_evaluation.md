@@ -90,28 +90,35 @@
 
 ## 출력 스키마
 
-시장 평가 노드는 자기 키만 반환한다(`market_result`, `references`). 기술별 구조 예시는 다음과 같다.
+시장 평가 노드는 자기 키만 반환한다(`market_result`, `references`). `market_result`는
+`technical_result`와 동일하게 **`tech_id`를 키로** 사용한다(예: `deepseek_v2_mla`, `itme`).
 
 ```json
 {
-  "technology": "DeepSeek-V2 MLA",
-  "tech_id": "deepseek_v2_mla",
-  "camp": "SW",
-  "score": 62.5,
-  "rationale": "종합 요약",
-  "evidence": [
-    {"source": "...", "url": "...", "as_of": "2024-05", "unit": "x", "baseline": "MHA", "value": 93.3}
-  ],
-  "items": {
-    "3-2-a": {
-      "item": "3-2-a",
-      "score": 4,
-      "confidence_tag": "보통",
-      "rationale": "...",
-      "sources": ["https://..."],
-      "evidence": [],
-      "attempts": 2
-    }
-  }
+  "market_result": {
+    "deepseek_v2_mla": {
+      "technology": "DeepSeek-V2 MLA",
+      "tech_id": "deepseek_v2_mla",
+      "camp": "SW",
+      "score": 62.5,
+      "rationale": "종합 요약",
+      "evidence": [
+        {"source": "...", "url": "...", "as_of": "2024-05", "unit": "x", "baseline": "MHA", "value": 93.3}
+      ],
+      "items": {
+        "3-2-a": {
+          "item": "3-2-a",
+          "score": 4,
+          "confidence_tag": "보통",
+          "rationale": "...",
+          "sources": ["https://..."],
+          "evidence": [],
+          "attempts": 2
+        }
+      }
+    },
+    "itme": {"...": "..."}
+  },
+  "references": []
 }
 ```

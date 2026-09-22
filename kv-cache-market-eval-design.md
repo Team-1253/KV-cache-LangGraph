@@ -202,18 +202,18 @@ graph TD
   - `technical_result`는 `tech_id`(`deepseek_v2_mla` \| `itme`)를 키로 하고 `camp`(SW/HW)·`title`·
     `overview`·`mechanism`·`scope`·`claims`·`measurements`·`limits_explicit`·`limits_implicit`·
     `evidence_level`·`retrieval`을 담는다(정의: `agents/TECHNICAL_RESULT_SCHEMA.md`).
-  - 시장 평가는 `camp`를 이용해 결과 키를 `sw`/`hw`로 정규화하고, `3-2-b`(비용·성능 효과)는
-    `measurements`를 우선 근거로 사용한다. `claims`(요약 주장)와 `measurements`(실험 측정치)는
-    섞지 않는다.
+  - 시장 평가는 `technical_result`와 동일하게 `tech_id`를 결과 키로 사용해 하류 Node와 키 체계를
+    통일한다. `3-2-b`(비용·성능 효과)는 `measurements`를 우선 근거로 사용하며, `claims`(요약
+    주장)와 `measurements`(실험 측정치)는 섞지 않는다.
 - 출력:
-  - `market_result`: 기술별 dict(키 `sw`/`hw`)
+  - `market_result`: 기술별 dict(**`tech_id` 키**)
 
     ```python
     market_result = {
-        "sw": {"technology": "...", "tech_id": "deepseek_v2_mla", "camp": "SW",
-               "score": 62.5, "rationale": "...", "evidence": [...],
-               "items": {"3-2-a": {...}, "3-2-b": {...}, "3-2-c": {...}, "3-2-d": {...}}},
-        "hw": {...},
+        "deepseek_v2_mla": {"technology": "DeepSeek-V2 MLA", "tech_id": "deepseek_v2_mla",
+                            "camp": "SW", "score": 62.5, "rationale": "...", "evidence": [...],
+                            "items": {"3-2-a": {...}, "3-2-b": {...}, "3-2-c": {...}, "3-2-d": {...}}},
+        "itme": {...},
     }
     ```
 
@@ -228,8 +228,8 @@ graph TD
 | 필드 | 설명 |
 | --- | --- |
 | `id` | 인용 식별자 |
-| `technology` | `"sw"` 또는 `"hw"` |
-| `item` | `E1`~`E4` |
+| `technology` | `tech_id` (`deepseek_v2_mla` \| `itme`) |
+| `item` | `3-2-a`~`3-2-d` |
 | `source` | 출처 명(문서명·URL·기관) |
 | `source_type` | `peer_review` / `vendor` / `official` / `community` 등 |
 | `as_of` | 기준 시점 |
