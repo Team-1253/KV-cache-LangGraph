@@ -19,4 +19,6 @@ uv.lock
 .cache/
 experiments/retrieval_bench/chunks_*.jsonl
 experiments/retrieval_bench/results*.json
-outputs/*.json
+
+# 실행결과
+outputs/*
