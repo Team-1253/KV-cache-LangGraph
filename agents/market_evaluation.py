@@ -458,6 +458,20 @@ _PEER_REVIEW_DOMAINS = (
     "aclweb.org",
     "neurips.cc",
 )
+_ANALYST_DOMAINS = (
+    "statista.com",
+    "gartner.com",
+    "idc.com",
+    "grandviewresearch.com",
+    "marketsandmarkets.com",
+    "mordorintelligence.com",
+    "precedenceresearch.com",
+    "fortunebusinessinsights.com",
+    "researchandmarkets.com",
+    "cbinsights.com",
+    "pitchbook.com",
+    "techinsights.com",
+)
 _OFFICIAL_DOMAINS = (
     "github.com",
     "huggingface.co",
@@ -511,6 +525,8 @@ def _source_type(url: str) -> str:
     host = urlparse(url).netloc.lower() or url.lower()
     if any(domain in host for domain in _PEER_REVIEW_DOMAINS):
         return "peer_review"
+    if any(domain in host for domain in _ANALYST_DOMAINS):
+        return "analyst"
     if any(domain in host for domain in _VENDOR_DOMAINS):
         return "vendor"
     if (
