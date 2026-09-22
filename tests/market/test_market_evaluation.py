@@ -75,17 +75,70 @@ def make_deps(results, judge_scores, rubric_score=3):
     return MarketDeps(search, judge, scorer), search, judge, scorer
 
 
+def _source(chunk_id="c1", page=1):
+    return {"chunk_id": chunk_id, "page": page}
+
+
 def make_state() -> EvaluationState:
     return EvaluationState(
         selected_technologies={"sw": "DeepSeek-V2 MLA", "hw": "ITME"},
         technical_result={
-            "sw": {
-                "summary": "s",
-                "performance": ["p"],
-                "limitations": ["l"],
-                "evidence": ["e"],
+            "deepseek_v2_mla": {
+                "tech_id": "deepseek_v2_mla",
+                "camp": "SW",
+                "title": "DeepSeek-V2 MLA",
+                "overview": "MLA compresses KV cache into a low-rank latent vector.",
+                "mechanism": [{"text": "joint low-rank compression", "source": _source()}],
+                "scope": [{"text": "long-context serving", "source": _source(page=2)}],
+                "claims": [
+                    {
+                        "text": "93.3% KV cache reduction",
+                        "baseline": "MHA",
+                        "source": _source(page=1),
+                    }
+                ],
+                "measurements": [
+                    {
+                        "metric": "KV cache",
+                        "value": "93.3%",
+                        "baseline": "MHA",
+                        "condition": "long context",
+                        "source": _source(page=5),
+                    }
+                ],
+                "limits_explicit": [],
+                "limits_implicit": [
+                    {
+                        "text": "compute overhead",
+                        "basis": "increased FLOPs",
+                        "source": _source(page=7),
+                    }
+                ],
+                "evidence_level": "strong",
+                "retrieval": {"chunks_used": 3},
             },
-            "hw": {},
+            "itme": {
+                "tech_id": "itme",
+                "camp": "HW",
+                "title": "ITME",
+                "overview": "CXL-Hybrid memory expansion.",
+                "mechanism": [],
+                "scope": [],
+                "claims": [],
+                "measurements": [
+                    {
+                        "metric": "throughput",
+                        "value": "35.7%",
+                        "baseline": "CPU-offload",
+                        "condition": "expansion turn",
+                        "source": _source(chunk_id="c9", page=6),
+                    }
+                ],
+                "limits_explicit": [],
+                "limits_implicit": [],
+                "evidence_level": "limited",
+                "retrieval": {},
+            },
         },
     )
 
@@ -198,6 +251,34 @@ def test_sw_and_hw_evaluated_separately():
     out = run_market_evaluation(make_state(), deps)
     assert out["market_result"]["sw"]["technology"] == "DeepSeek-V2 MLA"
     assert out["market_result"]["hw"]["technology"] == "ITME"
+
+
+def test_consumes_techprofile_schema():
+    deps, search, *_ = make_deps([_result()], [2, 2, 4])
+    out = run_market_evaluation(make_state(), deps)
+
+    sw = out["market_result"]["sw"]
+    assert sw["tech_id"] == "deepseek_v2_mla"
+    assert sw["camp"] == "SW"
+    assert out["market_result"]["hw"]["tech_id"] == "itme"
+    assert out["market_result"]["hw"]["camp"] == "HW"
+
+    joined = " ".join(call["query"] for call in search.calls)
+    # TechProfile의 overview/measurements가 쿼리 시드로 사용되어야 한다.
+    assert "latent vector" in joined
+    assert "93.3%" in joined
+    assert "CPU-offload" in joined
+
+
+def test_fallback_to_selected_technologies():
+    state = EvaluationState(
+        selected_technologies={"sw": "DeepSeek-V2 MLA", "hw": "ITME"},
+    )
+    deps, *_ = make_deps([_result()], [4])
+    out = run_market_evaluation(state, deps)
+    assert set(out["market_result"].keys()) == {"sw", "hw"}
+    assert out["market_result"]["sw"]["tech_id"] == "sw"
+    assert out["market_result"]["sw"]["camp"] == ""
 
 
 def test_partial_search_failure_is_tolerated():
