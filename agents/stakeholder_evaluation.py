@@ -1,10 +1,486 @@
-"""이해관계자 평가 Agent."""
+"""이해관계자 관점에서 기술을 조사하고 평가하는 LangChain Agent."""
+
+import json
+from pathlib import Path
+from typing import Annotated, Any, Literal
+from typing_extensions import TypedDict
+
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+from langchain.chat_models import init_chat_model
+from langchain_tavily import TavilySearch
 
 from agents.state import EvaluationState
 
+# 입력 경로 ------------------------------------------------------------
+WORK_DIR = Path(__file__).resolve().parent.parent
+RUBRIC_PATH = WORK_DIR / "data" / "3-3_stakeholder_evaluation.json"
+PROMPT_PATH = WORK_DIR / "prompts" / "stakeholder_evaluation.md"
 
-def stakeholder_evaluation_agent(state: EvaluationState) -> dict:
-    """경쟁사, 도입기업, 개발자와 투자업계 관점을 평가한다."""
 
-    # TODO: 웹 검색과 5개 이해관계자 평가 항목을 구현한다.
-    raise NotImplementedError
+# 구조화 출력용 class ------------------------------------------------------------
+class Evidence(TypedDict):
+    """평가 판단에 사용한 웹 검색 근거."""
+
+    title: Annotated[str, "출처 문서 또는 웹페이지 제목"]
+    url: Annotated[str, "웹 검색 결과에서 확인한 실제 URL"]
+    claim: Annotated[str, "이 출처가 평가 판단을 뒷받침하는 핵심 내용"]
+    source_category: Annotated[
+        Literal["DEVELOPER", "INDEPENDENT", "OTHER"],
+        "기술 개발 주체 자료인지, 독립적인 외부 자료인지 구분",
+    ]
+
+
+class CriterionAssessment(TypedDict):
+    """루브릭의 단일 평가 항목에 대한 결과."""
+
+    criterion_id: Annotated[
+        Literal["3-3-a", "3-3-b", "3-3-c", "3-3-d", "3-3-e"],
+        "평가 루브릭 항목 ID",
+    ]
+    status: Annotated[
+        Literal["VERIFIED", "NOT_VERIFIED"],
+        "판단 근거 확인 여부",
+    ]
+    score: Annotated[
+        int | None,
+        "VERIFIED이면 1~5점, NOT_VERIFIED이면 null",
+    ]
+    rationale: Annotated[
+        str,
+        "수집한 근거와 루브릭을 바탕으로 점수를 선택한 이유",
+    ]
+    evidence: Annotated[
+        list[Evidence],
+        "해당 항목의 판단에 실제로 사용한 출처 목록",
+    ]
+
+
+class TechnologyAssessment(TypedDict):
+    """하나의 기술에 대한 이해관계자 평가 결과."""
+
+    technology: Annotated[str, "평가 대상 기술명"]
+    criteria: Annotated[
+        list[CriterionAssessment],
+        "3-3-a부터 3-3-e까지의 평가 결과",
+    ]
+    summary: Annotated[
+        str,
+        "해당 기술에 대한 이해관계자 관점의 종합 요약",
+    ]
+
+
+# 로드 (환경변수, 루브릭, 프롬프트) -------------------------------------------------
+def load_environment() -> None:
+    """프로젝트 루트의 .env 파일을 불러온다."""
+
+    env_path = WORK_DIR / ".env"
+    load_dotenv(env_path)
+
+
+def load_rubric() -> dict[str, Any]:
+    """이해관계자 평가 루브릭 JSON을 읽고 기본 구조를 확인한다."""
+
+    with RUBRIC_PATH.open("r", encoding="utf-8") as file:
+        rubric: dict[str, Any] = json.load(file)
+
+    if rubric.get("id") != "3-3":
+        raise ValueError("이해관계자 평가 루브릭의 id는 '3-3'이어야 합니다.")
+
+    criteria = rubric.get("criteria")
+
+    if not isinstance(criteria, list) or len(criteria) != 5:
+        raise ValueError("이해관계자 평가 루브릭에는 5개 항목이 있어야 합니다.")
+
+    return rubric
+
+
+def load_system_prompt() -> str:
+    """이해관계자 평가 Agent의 시스템 프롬프트를 읽는다."""
+
+    prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
+
+    if not prompt:
+        raise ValueError("이해관계자 평가 프롬프트가 비어 있습니다.")
+
+    return prompt
+
+# Agent 생성 -------------------------------------------------
+def build_stakeholder_agent():
+    """Chat Model과 Tavily 검색 도구를 연결한 Agent를 생성한다."""
+
+    load_environment()
+
+    model = init_chat_model(
+        "gpt-4o-mini",
+        model_provider="openai",
+        temperature=0,
+    )
+
+    search_tool = TavilySearch(
+        max_results=5,
+        search_depth="advanced",
+        include_answer=False,
+        include_raw_content=False,
+    )
+
+    return create_agent(
+        model=model,
+        tools=[search_tool],
+        system_prompt=load_system_prompt(),
+        response_format=ToolStrategy(TechnologyAssessment),
+    )
+
+stakeholder_agent = build_stakeholder_agent()
+
+
+# 웹 검색 결과 바탕으로 평가 요청 메세지 생성 -----------------------
+def build_evaluation_request(
+    technology: str,
+    target_domain: str,
+    technical_context: Any,
+    rubric: dict[str, Any],
+) -> str:
+    """기술 정보와 평가 루브릭을 Agent 입력 메시지로 만든다."""
+
+    rubric_text = json.dumps(
+        rubric,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    technical_context_text = json.dumps(
+        technical_context,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+
+    return f"""
+다음 기술을 이해관계자 관점에서 평가하세요.
+
+평가 대상 기술:
+{technology}
+
+적용 대상 도메인:
+{target_domain}
+
+이전 기술 조사 Agent가 전달한 정보:
+{technical_context_text}
+
+반드시 적용해야 하는 평가 루브릭:
+{rubric_text}
+
+수행 요구사항:
+
+1. 루브릭의 3-3-a부터 3-3-e까지 모든 항목을 평가하세요.
+2. 각 항목에 필요한 최신 외부 근거를 웹 검색 도구로 조사하세요.
+3. 각 평가 항목은 정확히 한 번씩 결과에 포함하세요.
+4. 확인된 근거가 있는 경우에만 VERIFIED와 1~5점 점수를 부여하세요.
+5. 조사했지만 근거를 확인하지 못한 경우 NOT_VERIFIED와 null 점수를 반환하세요.
+6. 검색 결과에 실제로 존재하는 URL만 evidence에 포함하세요.
+7. 총점은 계산하지 마세요.
+""".strip()
+
+# Agent 실행 및 결과 검증 ------------
+EXPECTED_CRITERION_IDS = {
+    "3-3-a",
+    "3-3-b",
+    "3-3-c",
+    "3-3-d",
+    "3-3-e",
+}
+
+def validate_assessment(
+    assessment: TechnologyAssessment,
+) -> TechnologyAssessment:
+    """Agent 결과가 루브릭의 필수 조건을 만족하는지 확인한다."""
+
+    criteria = assessment.get("criteria", [])
+
+    if len(criteria) != 5:
+        raise ValueError("이해관계자 평가 결과는 정확히 5개 항목이어야 합니다.")
+
+    actual_ids = [item["criterion_id"] for item in criteria]
+
+    if set(actual_ids) != EXPECTED_CRITERION_IDS:
+        raise ValueError(
+            "이해관계자 평가 결과에는 "
+            "3-3-a부터 3-3-e까지 모든 항목이 포함되어야 합니다."
+        )
+
+    if len(actual_ids) != len(set(actual_ids)):
+        raise ValueError("이해관계자 평가 항목 ID가 중복되었습니다.")
+
+    for item in criteria:
+        criterion_id = item["criterion_id"]
+        status = item["status"]
+        score = item["score"]
+        evidence = item["evidence"]
+
+        if status == "VERIFIED":
+            if not isinstance(score, int) or not 1 <= score <= 5:
+                raise ValueError(
+                    f"{criterion_id}의 VERIFIED 점수는 1~5 사이의 정수여야 합니다."
+                )
+
+            if not evidence:
+                raise ValueError(
+                    f"{criterion_id}가 VERIFIED이지만 출처가 없습니다."
+                )
+
+        if status == "NOT_VERIFIED" and score is not None:
+            raise ValueError(
+                f"{criterion_id}가 NOT_VERIFIED이면 점수는 null이어야 합니다."
+            )
+
+        for source in evidence:
+            if not source["url"].startswith(("http://", "https://")):
+                raise ValueError(
+                    f"{criterion_id}에 올바르지 않은 출처 URL이 있습니다."
+                )
+
+    return assessment
+
+
+def run_technology_assessment(
+    technology: str,
+    target_domain: str,
+    technical_context: Any,
+    rubric: dict[str, Any],
+) -> TechnologyAssessment:
+    """하나의 기술에 대해 웹 검색과 이해관계자 평가를 수행한다."""
+
+    request = build_evaluation_request(
+        technology=technology,
+        target_domain=target_domain,
+        technical_context=technical_context,
+        rubric=rubric,
+    )
+
+    result = stakeholder_agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": request,
+                }
+            ]
+        },
+        config={"recursion_limit": 10},
+    )
+
+    assessment = result.get("structured_response")
+
+    if assessment is None:
+        raise ValueError("Agent가 구조화된 평가 결과를 반환하지 않았습니다.")
+
+    return validate_assessment(assessment)
+
+
+# 총점 계산 및 출처 정리
+def calculate_total_score(
+    criteria: list[CriterionAssessment],
+    rubric: dict[str, Any],
+) -> float | None:
+    """루브릭의 배점 정보를 이용해 100점 환산 총점을 계산한다."""
+
+    if any(item["status"] == "NOT_VERIFIED" for item in criteria):
+        return None
+
+    scores = [
+        item["score"]
+        for item in criteria
+        if item["score"] is not None
+    ]
+
+    scoring = rubric["scoring"]
+    item_count = scoring["item_count"]
+    maximum_item_score = max(scoring["item_score_range"])
+    maximum_total = item_count * maximum_item_score
+
+    return round(sum(scores) / maximum_total * 100, 1)
+
+
+def prepare_assessment_for_state(
+    technology_key: Literal["sw", "hw"],
+    assessment: TechnologyAssessment,
+    rubric: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Agent 평가 결과를 stakeholder_result와 references 형태로 변환한다."""
+
+    references: list[dict[str, Any]] = []
+    normalized_criteria: list[dict[str, Any]] = []
+
+    for criterion in assessment["criteria"]:
+        criterion_id = criterion["criterion_id"]
+        evidence_ids: list[str] = []
+
+        for index, source in enumerate(criterion["evidence"], start=1):
+            evidence_id = (
+                f"stakeholder-{technology_key}-{criterion_id}-{index:02d}"
+            )
+
+            evidence_ids.append(evidence_id)
+
+            references.append(
+                {
+                    "evidence_id": evidence_id,
+                    "agent": "stakeholder_evaluation",
+                    "technology": assessment["technology"],
+                    "criterion_id": criterion_id,
+                    "title": source["title"],
+                    "url": source["url"],
+                    "claim": source["claim"],
+                    "source_category": source["source_category"],
+                }
+            )
+
+        normalized_criteria.append(
+            {
+                "criterion_id": criterion_id,
+                "status": criterion["status"],
+                "score": criterion["score"],
+                "rationale": criterion["rationale"],
+                "evidence_ids": evidence_ids,
+            }
+        )
+
+    total_score = calculate_total_score(
+        criteria=assessment["criteria"],
+        rubric=rubric,
+    )
+
+    state_result = {
+        "technology": assessment["technology"],
+        "criteria": normalized_criteria,
+        "total_score": total_score,
+        "summary": assessment["summary"],
+    }
+
+    return state_result, references
+
+
+# LangGraph 노드 완성
+
+def stakeholder_evaluation_agent(
+    state: EvaluationState,
+) -> dict[str, Any]:
+    """SW와 HW 기술을 이해관계자 관점에서 평가한다."""
+
+    selected_technologies = state.get("selected_technologies")
+    technical_result = state.get("technical_result")
+    target_domain = state.get("target_domain")
+
+    if not selected_technologies:
+        raise ValueError("State에 selected_technologies가 없습니다.")
+
+    if not technical_result:
+        raise ValueError("State에 technical_result가 없습니다.")
+
+    if not target_domain:
+        raise ValueError("State에 target_domain이 없습니다.")
+
+    if "sw" not in selected_technologies or "hw" not in selected_technologies:
+        raise ValueError(
+            "selected_technologies에는 sw와 hw가 모두 있어야 합니다."
+        )
+
+    if "sw" not in technical_result or "hw" not in technical_result:
+        raise ValueError(
+            "technical_result에는 sw와 hw 조사 결과가 모두 있어야 합니다."
+        )
+
+    rubric = load_rubric()
+
+    sw_assessment = run_technology_assessment(
+        technology=selected_technologies["sw"],
+        target_domain=target_domain,
+        technical_context=technical_result["sw"],
+        rubric=rubric,
+    )
+
+    hw_assessment = run_technology_assessment(
+        technology=selected_technologies["hw"],
+        target_domain=target_domain,
+        technical_context=technical_result["hw"],
+        rubric=rubric,
+    )
+
+    sw_result, sw_references = prepare_assessment_for_state(
+        technology_key="sw",
+        assessment=sw_assessment,
+        rubric=rubric,
+    )
+
+    hw_result, hw_references = prepare_assessment_for_state(
+        technology_key="hw",
+        assessment=hw_assessment,
+        rubric=rubric,
+    )
+
+    return {
+        "stakeholder_result": {
+            "sw": sw_result,
+            "hw": hw_result,
+        },
+        "references": sw_references + hw_references,
+    }
+
+
+# --------- 테스트 코드
+if __name__ == "__main__":
+    test_state: EvaluationState = {
+        "selected_technologies": {
+            "sw": "DeepSeek-V2 MLA",
+            "hw": "SK hynix ITME",
+        },
+        "target_domain": "데이터센터",
+        "technical_result": {
+            "sw": {
+                "summary": (
+                    "DeepSeek-V2 MLA는 Key와 Value 정보를 저차원 latent vector로 "
+                    "압축해 KV Cache 크기를 줄이는 Attention 구조다."
+                ),
+                "performance": [
+                    "기존 Multi-Head Attention 대비 KV Cache 저장량 감소",
+                    "긴 Context와 높은 동시성을 지원하기 위한 구조",
+                ],
+                "limitations": [
+                    "기존 모델에 적용하려면 모델 구조 변경이나 재학습이 필요할 수 있음",
+                    "Decoupled RoPE 등 추가적인 구조 복잡성이 존재함",
+                ],
+                "evidence_ids": [
+                    "technical-sw-01",
+                ],
+            },
+            "hw": {
+                "summary": (
+                    "SK hynix ITME는 CXL 기반 Hybrid Memory를 활용해 "
+                    "LLM 추론의 메모리 계층을 확장하는 하드웨어 접근이다."
+                ),
+                "performance": [
+                    "GPU 메모리 용량 제약을 완화하기 위한 메모리 확장 접근",
+                    "CXL 기반 메모리 계층과 데이터 이동 최적화",
+                ],
+                "limitations": [
+                    "새로운 메모리 장비와 서버 인프라 구성이 필요할 수 있음",
+                    "공개된 결과가 프로토타입 중심일 가능성이 있음",
+                ],
+                "evidence_ids": [
+                    "technical-hw-01",
+                ],
+            },
+        },
+    }
+
+    test_result = stakeholder_evaluation_agent(test_state)
+
+    print(
+        json.dumps(
+            test_result,
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
