@@ -6,9 +6,8 @@ from typing import Annotated, Any, Literal
 from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_tavily import TavilySearch
 
 from agents.state import EvaluationState
@@ -106,35 +105,6 @@ def load_system_prompt() -> str:
 
     return prompt
 
-# Agent 생성 -------------------------------------------------
-def build_stakeholder_agent():
-    """Chat Model과 Tavily 검색 도구를 연결한 Agent를 생성한다."""
-
-    load_environment()
-
-    model = init_chat_model(
-        "gpt-4o-mini",
-        model_provider="openai",
-        temperature=0,
-    )
-
-    search_tool = TavilySearch(
-        max_results=5,
-        search_depth="advanced",
-        include_answer=False,
-        include_raw_content=False,
-    )
-
-    return create_agent(
-        model=model,
-        tools=[search_tool],
-        system_prompt=load_system_prompt(),
-        response_format=ToolStrategy(TechnologyAssessment),
-    )
-
-stakeholder_agent = build_stakeholder_agent()
-
-
 # 웹 검색 결과 바탕으로 평가 요청 메세지 생성 -----------------------
 def build_evaluation_request(
     technology: str,
@@ -175,7 +145,7 @@ def build_evaluation_request(
 수행 요구사항:
 
 1. 루브릭의 3-3-a부터 3-3-e까지 모든 항목을 평가하세요.
-2. 각 항목에 필요한 최신 외부 근거를 웹 검색 도구로 조사하세요.
+2. 각 항목에 제공된 웹 검색 결과를 근거로 평가하세요. 검색은 호출 측에서 수행합니다.
 3. 각 평가 항목은 정확히 한 번씩 결과에 포함하세요.
 4. 확인된 근거가 있는 경우에만 VERIFIED와 1~5점 점수를 부여하세요.
 5. 조사했지만 근거를 확인하지 못한 경우 NOT_VERIFIED와 null 점수를 반환하세요.
@@ -250,7 +220,16 @@ def run_technology_assessment(
     technical_context: Any,
     rubric: dict[str, Any],
 ) -> TechnologyAssessment:
-    """하나의 기술에 대해 웹 검색과 이해관계자 평가를 수행한다."""
+    """최초 평가 후 NOT_VERIFIED 항목만 한 번 재검색·재평가한다."""
+
+    load_environment()
+    model = init_chat_model(
+        "gpt-4o-mini", model_provider="openai", temperature=0,
+    ).with_structured_output(TechnologyAssessment)
+    search = TavilySearch(
+        max_results=5, search_depth="advanced",
+        include_answer=False, include_raw_content=False,
+    )
 
     request = build_evaluation_request(
         technology=technology,
@@ -259,24 +238,47 @@ def run_technology_assessment(
         rubric=rubric,
     )
 
-    result = stakeholder_agent.invoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": request,
-                }
-            ]
-        },
-        config={"recursion_limit": 10},
-    )
+    evaluated: dict[str, CriterionAssessment] = {}
+    search_results: dict[str, list[Any]] = {}
+    for attempt in range(2):  # 최초 검색 1회 + 미확인 항목의 재검색 1회
+        pending = [
+            criterion for criterion in rubric["criteria"]
+            if evaluated.get(criterion["id"], {}).get("status") != "VERIFIED"
+        ]
+        if not pending:
+            break
+        for criterion in pending:
+            query = f"{technology} {criterion['question']}"
+            if attempt == 1:
+                query += " " + " ".join(criterion["evidence"])
+            search_results.setdefault(criterion["id"], []).append({
+                "query": query,
+                "result": search.invoke({"query": query}),
+            })
+        response = model.invoke([
+            SystemMessage(content=load_system_prompt()),
+            HumanMessage(content=request + "\n\n" + json.dumps({
+                "search_results": search_results,
+                "previous_assessments": evaluated,
+                "reevaluate_ids": [c["id"] for c in pending],
+                "instruction": "다섯 항목을 모두 반환하되, 이전 VERIFIED 항목은 유지하세요. 근거가 없으면 NOT_VERIFIED와 null을 반환하세요.",
+            }, ensure_ascii=False)),
+        ])
+        # 미확인 값은 항상 null로 보존한다. 총점 계산에서만 0점으로 환산한다.
+        for item in response["criteria"]:
+            if item["status"] == "NOT_VERIFIED":
+                item["score"] = None
+        validated = validate_assessment(response)
+        by_id = {item["criterion_id"]: item for item in validated["criteria"]}
+        for criterion in pending:
+            evaluated[criterion["id"]] = by_id[criterion["id"]]
 
-    assessment = result.get("structured_response")
-
-    if assessment is None:
-        raise ValueError("Agent가 구조화된 평가 결과를 반환하지 않았습니다.")
-
-    return validate_assessment(assessment)
+    criteria = [evaluated[c["id"]] for c in rubric["criteria"]]
+    return validate_assessment({
+        "technology": technology,
+        "criteria": criteria,
+        "summary": " / ".join(f"{item['criterion_id']}: {item['rationale']}" for item in criteria),
+    })
 
 
 # 총점 계산 및 출처 정리
