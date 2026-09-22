@@ -13,5 +13,4 @@ venv/
 .vscode/
 
 # 환경 스캐폴딩 
-pyproject.toml
 uv.lock
