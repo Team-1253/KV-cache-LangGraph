@@ -2,15 +2,15 @@
 
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal
-from typing_extensions import TypedDict
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_tavily import TavilySearch
-from langgraph.errors import GraphRecursionError
+from pydantic import BaseModel, Field
 
+from agents.resilient import error_record
 from agents.state import EvaluationState
 
 # 입력 경로 ------------------------------------------------------------
@@ -20,55 +20,47 @@ PROMPT_PATH = WORK_DIR / "prompts" / "stakeholder_evaluation.md"
 
 
 # 구조화 출력용 class ------------------------------------------------------------
-class Evidence(TypedDict):
+class Evidence(BaseModel):
     """평가 판단에 사용한 웹 검색 근거."""
 
-    title: Annotated[str, "출처 문서 또는 웹페이지 제목"]
-    url: Annotated[str, "웹 검색 결과에서 확인한 실제 URL"]
-    claim: Annotated[str, "이 출처가 평가 판단을 뒷받침하는 핵심 내용"]
-    source_category: Annotated[
-        Literal["DEVELOPER", "INDEPENDENT", "OTHER"],
-        "기술 개발 주체 자료인지, 독립적인 외부 자료인지 구분",
-    ]
+    title: str = Field(description="출처 문서 또는 웹페이지 제목")
+    url: str = Field(description="웹 검색 결과에서 확인한 실제 URL")
+    claim: str = Field(description="이 출처가 평가 판단을 뒷받침하는 핵심 내용")
+    source_category: Literal["DEVELOPER", "INDEPENDENT", "OTHER"] = Field(
+        description="기술 개발 주체 자료인지, 독립적인 외부 자료인지 구분",
+    )
 
 
-class CriterionAssessment(TypedDict):
+class CriterionAssessment(BaseModel):
     """루브릭의 단일 평가 항목에 대한 결과."""
 
-    criterion_id: Annotated[
-        Literal["3-3-a", "3-3-b", "3-3-c", "3-3-d", "3-3-e"],
-        "평가 루브릭 항목 ID",
-    ]
-    status: Annotated[
-        Literal["VERIFIED", "NOT_VERIFIED"],
-        "판단 근거 확인 여부",
-    ]
-    score: Annotated[
-        int | None,
-        "VERIFIED이면 1~5점, NOT_VERIFIED이면 null",
-    ]
-    rationale: Annotated[
-        str,
-        "수집한 근거와 루브릭을 바탕으로 점수를 선택한 이유",
-    ]
-    evidence: Annotated[
-        list[Evidence],
-        "해당 항목의 판단에 실제로 사용한 출처 목록",
-    ]
+    criterion_id: Literal["3-3-a", "3-3-b", "3-3-c", "3-3-d", "3-3-e"] = Field(
+        description="평가 루브릭 항목 ID",
+    )
+    status: Literal["VERIFIED", "NOT_VERIFIED"] = Field(
+        description="판단 근거 확인 여부",
+    )
+    score: int | None = Field(
+        description="VERIFIED이면 1~5점, NOT_VERIFIED이면 null",
+    )
+    rationale: str = Field(
+        description="수집한 근거와 루브릭을 바탕으로 점수를 선택한 이유",
+    )
+    evidence: list[Evidence] = Field(
+        description="해당 항목의 판단에 실제로 사용한 출처 목록",
+    )
 
 
-class TechnologyAssessment(TypedDict):
+class TechnologyAssessment(BaseModel):
     """하나의 기술에 대한 이해관계자 평가 결과."""
 
-    technology: Annotated[str, "평가 대상 기술명"]
-    criteria: Annotated[
-        list[CriterionAssessment],
-        "3-3-a부터 3-3-e까지의 평가 결과",
-    ]
-    summary: Annotated[
-        str,
-        "해당 기술에 대한 이해관계자 관점의 종합 요약",
-    ]
+    technology: str = Field(description="평가 대상 기술명")
+    criteria: list[CriterionAssessment] = Field(
+        description="3-3-a부터 3-3-e까지의 평가 결과",
+    )
+    summary: str = Field(
+        description="해당 기술에 대한 이해관계자 관점의 종합 요약",
+    )
 
 
 # 로드 (환경변수, 루브릭, 프롬프트) -------------------------------------------------
@@ -164,8 +156,8 @@ EXPECTED_CRITERION_IDS = {
 }
 
 def validate_assessment(
-    assessment: TechnologyAssessment,
-) -> TechnologyAssessment:
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
     """Agent 결과가 루브릭의 필수 조건을 만족하는지 확인한다."""
 
     criteria = assessment.get("criteria", [])
@@ -220,16 +212,14 @@ def run_technology_assessment(
     target_domain: str,
     technical_context: Any,
     rubric: dict[str, Any],
-) -> TechnologyAssessment:
+) -> dict[str, Any]:
     """항목별로 한 번 검색하고 한 번 평가한다. 미확인 항목은 null로 반환한다."""
 
     load_environment()
-    model = init_chat_model(
-        "gpt-4o-mini", model_provider="openai", temperature=0,
-    ).with_structured_output(TechnologyAssessment)
     search = TavilySearch(
         max_results=5, search_depth="advanced",
         include_answer=False, include_raw_content=False,
+        handle_tool_error=False,
     )
 
     request = build_evaluation_request(
@@ -240,29 +230,69 @@ def run_technology_assessment(
     )
 
     search_results: dict[str, Any] = {}
+    failed_criteria: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, str]] = []
     for criterion in rubric["criteria"]:
+        criterion_id = criterion["id"]
         query = f"{technology} {criterion['question']}"
-        search_results[criterion["id"]] = {
+        try:
+            result = search.invoke({"query": query})
+            # TavilySearch는 API 예외를 raise 대신 {"error": 예외 객체}로 반환한다.
+            if isinstance(result, dict) and "error" in result:
+                failure = result["error"]
+                if isinstance(failure, Exception):
+                    raise failure
+                raise RuntimeError("웹 검색이 실패했습니다.")
+            if not isinstance(result, dict):
+                raise ValueError("웹 검색 결과가 객체가 아닙니다.")
+        except Exception as exc:
+            error = error_record(f"stakeholder/search/{technology}/{criterion_id}", exc)
+            errors.append(error)
+            result = {"results": [], "error": error}
+            failed_criteria[criterion_id] = {
+                "criterion_id": criterion_id,
+                "status": "NOT_VERIFIED",
+                "score": None,
+                "rationale": f"웹 검색 실패({error['error_type']})로 평가하지 못했습니다.",
+                "evidence": [],
+            }
+        search_results[criterion_id] = {
             "query": query,
-            "result": search.invoke({"query": query}),
+            "result": result,
         }
+
+    if len(failed_criteria) == len(rubric["criteria"]):
+        return validate_assessment({
+            "technology": technology,
+            "criteria": list(failed_criteria.values()),
+            "summary": "모든 항목의 웹 검색이 실패해 이해관계자 평가를 완료하지 못했습니다.",
+            "run_errors": errors,
+        })
+
+    model = init_chat_model(
+        "gpt-4o-mini", model_provider="openai", temperature=0,
+    ).with_structured_output(TechnologyAssessment)
+    # Pydantic v2로 필수 필드와 nullable 점수를 보존하고, state에는 dict만 전달한다.
     response = model.invoke([
         SystemMessage(content=load_system_prompt()),
         HumanMessage(content=request + "\n\n" + json.dumps({
             "search_results": search_results,
-            "instruction": "다섯 항목을 모두 반환하세요. 미확인 항목도 생략하지 말고 NOT_VERIFIED와 null로 반환하세요. 재검색·재평가는 없습니다.",
+            "instruction": "다섯 항목을 모두 반환하세요. 검색 실패 항목과 미확인 항목은 NOT_VERIFIED와 null로 반환하고, 검색 실패를 요약에도 명시하세요. 재검색·재평가는 없습니다.",
         }, ensure_ascii=False)),
-    ])
+    ]).model_dump()
     response["technology"] = technology
     for item in response["criteria"]:
+        if item["criterion_id"] in failed_criteria:
+            item.update(failed_criteria[item["criterion_id"]])
         if item["status"] == "NOT_VERIFIED":
             item["score"] = None
+    response["run_errors"] = errors
     return validate_assessment(response)
 
 
 # 총점 계산 및 출처 정리
 def calculate_total_score(
-    criteria: list[CriterionAssessment],
+    criteria: list[dict[str, Any]],
     rubric: dict[str, Any],
 ) -> float:
     """NOT_VERIFIED를 0점으로 처리해 100점 환산 총점을 계산한다."""
@@ -295,7 +325,7 @@ def calculate_total_score(
 
 def prepare_assessment_for_state(
     technology_id: str,
-    assessment: TechnologyAssessment,
+    assessment: dict[str, Any],
     rubric: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Agent 평가 결과를 stakeholder_result와 references 형태로 변환한다."""
@@ -400,6 +430,7 @@ def stakeholder_evaluation_agent(
 
     stakeholder_results: dict[str, Any] = {}
     all_references: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
 
     for tech_id in REQUIRED_TECH_IDS:
         tech_profile = technical_result[tech_id]
@@ -409,30 +440,12 @@ def stakeholder_evaluation_agent(
                 f"technical_result의 키와 TechProfile.tech_id가 다릅니다: {tech_id}"
             )
 
-        try:
-            assessment = run_technology_assessment(
-                technology=tech_profile["title"],
-                target_domain=target_domain,
-                technical_context=tech_profile,
-                rubric=rubric,
-            )
-        except GraphRecursionError:
-            reason = "이해관계자 조사 중 실행 단계 제한에 도달해 평가를 완료하지 못했습니다."
-            print(f"[이해관계자 평가] {tech_profile['title']}: {reason}")
-            assessment = {
-                "technology": tech_profile["title"],
-                "criteria": [
-                    {
-                        "criterion_id": item["id"],
-                        "status": "NOT_VERIFIED",
-                        "score": None,
-                        "rationale": reason,
-                        "evidence": [],
-                    }
-                    for item in rubric["criteria"]
-                ],
-                "summary": reason,
-            }
+        assessment = run_technology_assessment(
+            technology=tech_profile["title"],
+            target_domain=target_domain,
+            technical_context=tech_profile,
+            rubric=rubric,
+        )
 
         state_result, references = prepare_assessment_for_state(
             technology_id=tech_id,
@@ -442,10 +455,12 @@ def stakeholder_evaluation_agent(
 
         stakeholder_results[tech_id] = state_result
         all_references.extend(references)
+        errors.extend(assessment.get("run_errors", []))
 
     return {
         "stakeholder_result": stakeholder_results,
         "references": all_references,
+        "run_errors": errors,
     }
 
 # --------- 테스트 코드
