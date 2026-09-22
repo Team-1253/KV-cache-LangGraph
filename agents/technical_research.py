@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+import json
 import re
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,10 @@ PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "technical_re
 NOT_VERIFIED = "NOT_VERIFIED"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+TRL_RUBRIC_PATH = DATA_DIR / "3-1_technology_readiness.json"
+
+# 평가 기준일. 문헌 발표 후 경과 기간을 재는 고정 시점이다.
+AS_OF = date(2026, 9, 22)
 
 # ── 기술 레지스트리 ──────────────────────────────────────────
 # state["selected_technologies"]는 `dict[str, str]` 계약이라 PDF 경로를 담지 못한다.
@@ -39,6 +45,7 @@ TECH_REGISTRY: dict[str, dict[str, str]] = {
     "deepseek_v2_mla": {
         "camp": "SW",
         "name": "DeepSeek-V2 (MLA)",
+        "published": "2024-06",
         "pdf": str(DATA_DIR / "DeepSeekV2_2405.04434v5.pdf"),
         "citation": (
             "DeepSeek-AI(2024). DeepSeek-V2: A Strong, Economical, and Efficient "
@@ -49,6 +56,7 @@ TECH_REGISTRY: dict[str, dict[str, str]] = {
     "itme": {
         "camp": "HW",
         "name": "ITME (CXL-Hybrid Tiered Memory Expansion)",
+        "published": "2026-06",
         "pdf": str(DATA_DIR / "ITME_2606.12556v2.pdf"),
         "citation": (
             "Jang, H. et al.(2026). ITME: Inference Tiered Memory Expansion with "
@@ -75,6 +83,18 @@ ASPECT_QUERIES: list[str] = [
 
 
 # ── 프롬프트 로딩 ────────────────────────────────────────────
+@lru_cache(maxsize=1)
+def _trl_rubric() -> dict:
+    """TRL 척도는 팀 공용 루브릭(`data/3-1_technology_readiness.json`)을 단일 소스로 쓴다."""
+    return json.loads(TRL_RUBRIC_PATH.read_text(encoding="utf-8"))
+
+
+def _elapsed_months(published: str, as_of: date = AS_OF) -> int:
+    """문헌 발표 후 기준일까지 경과 개월. TRL 해석 시 반드시 함께 읽어야 한다."""
+    y, m = (int(x) for x in published.split("-")[:2])
+    return (as_of.year - y) * 12 + (as_of.month - m)
+
+
 @lru_cache(maxsize=1)
 def _prompt_sections() -> dict[str, str]:
     """`prompts/technical_research.md`의 `## [SECTION]` 블록을 파싱한다."""
@@ -362,6 +382,7 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
                     sec["TRL_USER"].format(
                         tech_name=name,
                         profile="\n".join(f"- {k}: {v}" for k, v in digest.items()),
+                        rubric=json.dumps(_trl_rubric(), ensure_ascii=False, indent=2),
                     )
                 ),
             ]
@@ -379,9 +400,24 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
         else:
             lo = hi = 0  # 판정 불가
 
+        meta = TECH_REGISTRY.get(tid, {})
+        published = meta.get("published", NOT_VERIFIED)
+        elapsed = _elapsed_months(published) if published != NOT_VERIFIED else None
+
         results[tid] = {
             "tech_id": tid,
             "trl_range": [lo, hi] if comps else NOT_VERIFIED,
+            "evidence_scope": "paper_only",
+            "published": published,
+            "as_of": AS_OF.isoformat(),
+            "elapsed_months": elapsed,
+            "interpretation_caveat": (
+                "논문 근거만으로 판정한 값이다. 서로 다른 시점에 발표된 문헌의 TRL을 나란히 읽을 때는 "
+                "경과 기간(elapsed_months)을 함께 보아야 한다. 값이 같다는 것은 두 기술의 성숙도가 "
+                "비슷하다는 뜻이 아니라, 논문이라는 매체가 보여줄 수 있는 성숙도의 상한이 같다는 뜻이다. "
+                "실제 채택 근거는 시장성 관점(market_result)에서 별도로 다룬다."
+            ),
+            "rubric_source": TRL_RUBRIC_PATH.name,
             "range_derivation": (
                 "하한=핵심 구성요소 최저 단계, 상한=전체 구성요소 최고 단계. "
                 "LLM이 구간을 단언하지 않고 구성요소 판정에서 계산한다."
@@ -397,6 +433,7 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
             "source_evidence_level": profile.get("evidence_level", NOT_VERIFIED),
         }
         print(f"  TRL [{lo}, {hi}] · 구성요소 {len(verdict.components)}건 "
-              f"(핵심 {sum(c.is_critical for c in verdict.components)}건)")
+              f"(핵심 {sum(c.is_critical for c in verdict.components)}건) · "
+              f"발표 {published} · 경과 {elapsed}개월")
 
     return {"trl_result": results, "references": []}
