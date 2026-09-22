@@ -1,8 +1,8 @@
 """시장 평가 Agent.
 
-`data/3-2_market_evaluation.json` 룰브릭을 단일 소스로 사용한다. 기술(SW/HW) 1건마다
+`data/3-2_market_evaluation.json` 루브릭을 단일 소스로 사용한다. 기술(SW/HW) 1건마다
 항목(3-2-a ~ 3-2-d)을 순회하며 "쿼리 생성 → 웹검색 → 근거 판정 → (약함이면 재검색) →
-룰브릭 채점"을 수행한다. 바깥 그래프에는 단일 노드로 보이며, 항목별 상태 전이는 내부
+루브릭 채점"을 수행한다. 바깥 그래프에는 단일 노드로 보이며, 항목별 상태 전이는 내부
 LangGraph 서브그래프가 담당한다.
 
 노드는 자신이 생성한 State Key(`market_result`, `references`)만 반환한다.
@@ -48,7 +48,7 @@ class EvidenceJudgement(BaseModel):
 
 
 class RubricScore(BaseModel):
-    """확정 근거에 대한 룰브릭 채점."""
+    """확정 근거에 대한 루브릭 채점."""
 
     score: int = Field(ge=1, le=5)
     rationale: str = Field(description="판단 근거 요약")
@@ -168,7 +168,7 @@ def _tech_terms(tech_info: dict, criterion_id: str | None = None) -> list[str]:
 def build_queries(
     criterion: dict, technology: str, tech_info: dict, attempt: int
 ) -> list[str]:
-    """룰브릭의 evidence 목록과 기술 정보를 시드로 검색 쿼리를 만든다."""
+    """루브릭의 evidence 목록과 기술 정보를 시드로 검색 쿼리를 만든다."""
     question = criterion.get("question", "")
     evidence = criterion.get("evidence", []) or []
     seeds = " ".join(evidence)
