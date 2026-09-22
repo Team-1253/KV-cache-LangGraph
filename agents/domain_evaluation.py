@@ -1,11 +1,37 @@
 """데이터센터 환경의 KV Cache 기술 도메인 평가 Agent."""
 
+import json
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
 from agents.state import EvaluationState
+
+
+# ---------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+PROMPT_PATH = PROJECT_ROOT / "prompts" / "domain_evaluation.md"
+
+RUBRIC_PATH = PROJECT_ROOT / "data" / "3-4_domain_evaluation.json"
+
+
+# JSON rubric의 criterion id와 Python 필드 이름을 연결한다.
+CRITERION_FIELD_BY_ID = {
+    "3-4-a": "memory_efficiency",
+    "3-4-b": "inference_performance",
+    "3-4-c": "scalability",
+    "3-4-d": "infrastructure_applicability",
+    "3-4-e": "operational_cost_efficiency",
+    "3-4-f": "evidence_maturity",
+    "3-4-g": "independent_validation",
+    "3-4-h": "workload_representativeness",
+    "3-4-i": "recency_openness",
+}
 
 
 # ---------------------------------------------------------------------
@@ -81,7 +107,7 @@ class TechnologyDomainEvaluation(BaseModel):
     workload_representativeness: CriterionResult
     recency_openness: CriterionResult
 
-    # Python 코드에서 계산하는 값
+    # Python 코드에서 계산
     weighted_score: Optional[float] = None
     coverage: float = 0.0
     verdict: str = ""
@@ -95,21 +121,135 @@ class DomainResult(BaseModel):
 
 
 # ---------------------------------------------------------------------
-# Evaluation Weights
+# Rubric Loader
 # ---------------------------------------------------------------------
 
 
-DOMAIN_WEIGHTS = {
-    "memory_efficiency": 0.15,
-    "inference_performance": 0.16,
-    "scalability": 0.14,
-    "infrastructure_applicability": 0.13,
-    "operational_cost_efficiency": 0.12,
-    "evidence_maturity": 0.10,
-    "independent_validation": 0.08,
-    "workload_representativeness": 0.07,
-    "recency_openness": 0.05,
-}
+def load_domain_rubric() -> dict[str, Any]:
+    """data/3-4_domain_evaluation.json을 읽는다."""
+
+    if not RUBRIC_PATH.exists():
+        raise FileNotFoundError(
+            f"Domain evaluation rubric not found: {RUBRIC_PATH}"
+        )
+
+    with RUBRIC_PATH.open("r", encoding="utf-8") as file:
+        rubric = json.load(file)
+
+    if not isinstance(rubric, dict):
+        raise ValueError(
+            "Domain evaluation rubric must be a JSON object."
+        )
+
+    if "criteria" not in rubric:
+        raise ValueError(
+            "Domain evaluation rubric has no 'criteria'."
+        )
+
+    if "scoring" not in rubric:
+        raise ValueError(
+            "Domain evaluation rubric has no 'scoring'."
+        )
+
+    return rubric
+
+
+def get_domain_weights(
+    rubric: Optional[dict[str, Any]] = None,
+) -> dict[str, float]:
+    """JSON rubric에서 9개 평가 항목의 가중치를 읽는다."""
+
+    if rubric is None:
+        rubric = load_domain_rubric()
+
+    criteria = rubric.get("criteria")
+
+    if not isinstance(criteria, list):
+        raise ValueError(
+            "rubric['criteria'] must be a list."
+        )
+
+    weights: dict[str, float] = {}
+
+    for criterion in criteria:
+        criterion_id = criterion.get("id")
+
+        if criterion_id not in CRITERION_FIELD_BY_ID:
+            raise ValueError(
+                f"Unknown domain criterion id: {criterion_id}"
+            )
+
+        field_name = CRITERION_FIELD_BY_ID[criterion_id]
+
+        if "weight" not in criterion:
+            raise ValueError(
+                f"Criterion {criterion_id} has no weight."
+            )
+
+        weights[field_name] = float(criterion["weight"])
+
+    expected_fields = set(CRITERION_FIELD_BY_ID.values())
+    loaded_fields = set(weights.keys())
+
+    missing_fields = expected_fields - loaded_fields
+
+    if missing_fields:
+        raise ValueError(
+            "Missing domain criterion weights: "
+            + ", ".join(sorted(missing_fields))
+        )
+
+    total_weight = sum(weights.values())
+
+    if abs(total_weight - 1.0) > 1e-9:
+        raise ValueError(
+            f"Domain weights must sum to 1.0, got {total_weight}"
+        )
+
+    return weights
+
+
+def get_coverage_threshold(
+    rubric: Optional[dict[str, Any]] = None,
+) -> float:
+    """JSON rubric에서 coverage 판정 기준을 읽는다."""
+
+    if rubric is None:
+        rubric = load_domain_rubric()
+
+    scoring = rubric.get("scoring", {})
+
+    if "coverage_threshold" not in scoring:
+        raise ValueError(
+            "Rubric scoring has no coverage_threshold."
+        )
+
+    threshold = float(scoring["coverage_threshold"])
+
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"coverage_threshold must be between 0 and 1: {threshold}"
+        )
+
+    return threshold
+
+
+def get_default_target_domain(
+    rubric: Optional[dict[str, Any]] = None,
+) -> str:
+    """JSON rubric에 정의된 기본 평가 도메인을 반환한다."""
+
+    if rubric is None:
+        rubric = load_domain_rubric()
+
+    target_domain = rubric.get("target_domain")
+
+    if not target_domain:
+        raise ValueError(
+            "Domain rubric has no target_domain."
+        )
+
+    return str(target_domain)
 
 
 # ---------------------------------------------------------------------
@@ -122,14 +262,21 @@ def calculate_domain_score(
 ) -> TechnologyDomainEvaluation:
     """가중 점수와 evidence coverage를 계산한다.
 
-    NOT_VERIFIED 항목은 점수 계산에서 제외한다.
-    coverage가 0.6 미만이면 최종 판정을 보류한다.
+    가중치와 coverage threshold는
+    data/3-4_domain_evaluation.json에서 읽는다.
+
+    NOT_VERIFIED 항목은 점수와 coverage 계산에서 제외한다.
     """
+
+    rubric = load_domain_rubric()
+
+    domain_weights = get_domain_weights(rubric)
+    coverage_threshold = get_coverage_threshold(rubric)
 
     weighted_sum = 0.0
     covered_weight = 0.0
 
-    for criterion, weight in DOMAIN_WEIGHTS.items():
+    for criterion, weight in domain_weights.items():
         result = getattr(evaluation, criterion)
 
         if result.status == "NOT_VERIFIED":
@@ -143,14 +290,15 @@ def calculate_domain_score(
 
     evaluation.coverage = round(covered_weight, 3)
 
-    # 전체 가중치 중 60% 미만만 검증된 경우 판정 보류
-    if covered_weight < 0.6:
+    # 공식 rubric의 coverage threshold 미만이면 판정 보류
+    if covered_weight < coverage_threshold:
         evaluation.weighted_score = None
         evaluation.verdict = "판정 보류 — 근거 불충분"
 
         return evaluation
 
-    # NOT_VERIFIED를 제외한 검증 항목의 가중치 기준으로 정규화
+    # NOT_VERIFIED 항목을 제외한 검증 항목의
+    # 가중치 합으로 정규화한다.
     weighted_score = weighted_sum / covered_weight
 
     evaluation.weighted_score = round(weighted_score, 2)
@@ -177,13 +325,6 @@ def calculate_domain_score(
 # ---------------------------------------------------------------------
 # Prompt Loader
 # ---------------------------------------------------------------------
-
-
-PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "prompts"
-    / "domain_evaluation.md"
-)
 
 
 def load_domain_prompt() -> str:
@@ -213,19 +354,23 @@ def domain_evaluation_agent(state: EvaluationState) -> dict:
         - domain_result
         - references
 
-    현재 단계에서는 평가 스키마, 가중치 계산,
-    coverage 계산 및 Prompt 로딩까지 구현한다.
+    현재 구현:
+        - Structured Output Schema
+        - 공식 Domain Rubric 로딩
+        - 가중치 로딩
+        - coverage 계산
+        - 최종 verdict 계산
+        - Prompt 로딩
 
-    실제 RAG retrieval과 LLM Structured Output 연결은
-    팀 공통 Tool 인터페이스가 확정된 뒤 연결한다.
+    추후 공통 RAG Tool이 연결되면:
+        1. 기술별 Domain RAG 검색
+        2. 검색 근거 + technical_result를 LLM에 전달
+        3. Structured Output 생성
+        4. calculate_domain_score() 적용
+        5. domain_result + references 반환
     """
 
     technical_result = state.get("technical_result")
-
-    target_domain = state.get(
-        "target_domain",
-        "데이터센터",
-    )
 
     if not technical_result:
         raise ValueError(
@@ -233,17 +378,26 @@ def domain_evaluation_agent(state: EvaluationState) -> dict:
             "state['technical_result']"
         )
 
-    # Prompt 파일 정상 로딩 확인
+    rubric = load_domain_rubric()
     load_domain_prompt()
 
+    target_domain = state.get(
+        "target_domain"
+    ) or get_default_target_domain(rubric)
+
     # TODO:
-    # 1. 기술별 Domain RAG 검색
-    # 2. 검색된 근거 + technical_result를 LLM에 전달
+    # 1. 공통 RAG Tool을 이용해 기술별 관련 근거 검색
+    # 2. technical_result + retrieved evidence + rubric을 LLM에 전달
     # 3. TechnologyDomainEvaluation Structured Output 생성
     # 4. 각 기술에 calculate_domain_score() 적용
     # 5. DomainResult 생성
     # 6. references 생성
-    # 7. domain_result와 references만 반환
+    # 7. 아래 형태로 반환
+    #
+    # return {
+    #     "domain_result": domain_result,
+    #     "references": references,
+    # }
 
     raise NotImplementedError(
         "Domain RAG/LLM integration is not connected yet. "
