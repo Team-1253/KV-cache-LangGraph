@@ -343,20 +343,30 @@ def _score_node(system_prompt: str, deps: MarketDeps) -> Callable[[ItemState], d
         results = state.get("results", [])
         if evidence_score <= 0 or not results:
             return {
-                "score": 1,
+                "score": 0,
                 "rationale": state.get("judgement_reason", "근거를 확인하지 못함"),
                 "confidence_tag": TAG_NOT_VERIFIED,
                 "sources": [],
                 "evidence": [],
                 "source_refs": [],
             }
-        scored = deps.score_rubric(
-            system_prompt,
-            state["criterion"],
-            state["technology"],
-            results,
-            evidence_score,
-        )
+        try:
+            scored = deps.score_rubric(
+                system_prompt,
+                state["criterion"],
+                state["technology"],
+                results,
+                evidence_score,
+            )
+        except Exception:  # noqa: BLE001 - 채점 불가 시 0점 처리
+            return {
+                "score": 0,
+                "rationale": "채점을 수행할 수 없어 0점 처리",
+                "confidence_tag": TAG_NOT_VERIFIED,
+                "sources": [],
+                "evidence": [],
+                "source_refs": [],
+            }
         evidence = (
             _evidence_from_items(scored.evidence, results)
             if scored.evidence
@@ -593,7 +603,7 @@ def _total_score(items: dict[str, dict], criteria: list[dict]) -> float:
     if not denominator:
         return 0.0
     return round(
-        sum(item.get("score", 1) for item in items.values()) / denominator * 100, 2
+        sum(item.get("score", 0) for item in items.values()) / denominator * 100, 2
     )
 
 
@@ -673,7 +683,7 @@ def run_market_evaluation(
             )
             items[criterion["id"]] = {
                 "item": criterion["id"],
-                "score": final.get("score", 1),
+                "score": final.get("score", 0),
                 "confidence_tag": final.get("confidence_tag", TAG_NOT_VERIFIED),
                 "rationale": final.get("rationale", ""),
                 "sources": final.get("sources", []),
