@@ -1,6 +1,7 @@
 """평가 종합 Agent."""
 
 import json
+import re
 from pathlib import Path
 
 from langchain.chat_models import init_chat_model
@@ -18,6 +19,7 @@ _REQUIRED_INPUT_KEYS = (
 )
 
 _RESULT_KEYS = ("agreements", "disagreements", "tradeoffs", "implications")
+_REFERENCE_MARKER = re.compile(r"\[ref:[^\]\s]+\]")
 
 # 목록별 세 번째 구간의 고정 표시. 형식 검사 전용이며 의미 판단은 LLM에 맡긴다.
 _REQUIRED_SEGMENT = {
@@ -68,11 +70,24 @@ def _validate_result(parsed: object) -> dict[str, list[str]]:
         for item in value:
             if not item.strip():
                 raise ValueError(f"'{key}' 항목에 빈 문자열이 있습니다.")
-            segments = [seg.strip() for seg in item.split("|")]
-            if len(segments) < 3 or "관점:" not in item or "근거:" not in item:
+            # 마지막 근거 본문에 '|'가 들어가도 네 번째 구간 안에 보존한다.
+            segments = [seg.strip() for seg in item.split("|", 3)]
+            if (len(segments) != 4 or not segments[0]
+                    or not segments[1].startswith("관점:")
+                    or not segments[3].startswith("근거:")):
                 raise ValueError(f"'{key}' 항목은 '기술명 | 관점: ... | ... | 근거: ...' 형식이어야 합니다.")
             if not segments[2].startswith(_REQUIRED_SEGMENT[key]):
                 raise ValueError(f"'{key}' 항목의 세 번째 구간은 {list(_REQUIRED_SEGMENT[key])} 중 하나로 시작해야 합니다.")
+            unlinked_hold = (
+                key == "implications"
+                and segments[2].startswith("판단 보류/근거 공백:")
+                and "출처 연결 미확인" in segments[3]
+                and not _REFERENCE_MARKER.search(segments[3])
+            )
+            if not unlinked_hold and not _REFERENCE_MARKER.search(segments[3]):
+                raise ValueError(
+                    f"'{key}' 항목의 근거에는 실제 출처 ID를 '[ref:ID]' 형식으로 넣어야 합니다."
+                )
     return {key: list(parsed[key]) for key in _RESULT_KEYS}
 
 
