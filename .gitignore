@@ -14,3 +14,9 @@ venv/
 
 # 환경 스캐폴딩 
 uv.lock
+
+# RAG 캐시 (벡터 인덱스는 커밋하지 않음)
+.cache/
+experiments/retrieval_bench/chunks_*.jsonl
+experiments/retrieval_bench/results*.json
+outputs/*.json
