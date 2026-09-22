@@ -8,7 +8,7 @@
 | 약칭 | 문서 | 위치 |
 | --- | --- | --- |
 | D1 | 시장성 관점 설계서 `kv-cache-market-eval-design.md` | 로컬 |
-| D2 | 시장 룰브릭 `data/3-2_market_evaluation.json` | develop |
+| D2 | 시장 루브릭 `data/3-2_market_evaluation.json` | develop |
 | D3 | `agents/TECHNICAL_RESULT_SCHEMA.md` | `feature/technical-research` |
 | D4 | 팀 설계 산출물 PDF `RAG-Design_...pdf` | 로컬 |
 | D5 | `CONTRIBUTING.md` | 로컬 |
@@ -24,7 +24,7 @@
 | 코드 위치 | 구현 내용 | 주 출처 | 보조 |
 | --- | --- | --- | --- |
 | `1-13` 모듈 docstring | 단일 노드·자기 키만 반환·내부 상태 전이 | D5 규칙3 | D1 §6 |
-| `28-30` 경로 상수 | 룰브릭·프롬프트 로드 대상 | D2, D6 | — |
+| `28-30` 경로 상수 | 루브릭·프롬프트 로드 대상 | D2, D6 | — |
 | `32-33` `MAX_ATTEMPTS=3`, `CONFIRM_THRESHOLD=3` | 검색 종료 조건 | D1 §5 | U(≥3 확정) |
 | `35-38` `TAG_*` | 신뢰도 태그 4종 | D1 §5 | D2 `scoring.evidence_confidence_tags` |
 | `44-48` `EvidenceJudgement` | 근거 품질(종료) 판정 | D1 §5·§6 | D6 태스크1 |
@@ -58,7 +58,7 @@
 
 ## 3. 핵심 근거 요약
 
-- **룰브릭·배점·태그·항목 id**(`3-2-a`~`3-2-d`) → D2, D1 §4
+- **루브릭·배점·태그·항목 id**(`3-2-a`~`3-2-d`) → D2, D1 §4
 - **검색 종료 규칙**(≥3 확정 / ≤2 재검색 / 최대 3회) → D1 §5, U
 - **상태 전이(서브그래프) 설계** → D1 §6, U 확정
 - **규칙 7 evidence 구조화**(출처·기준 시점·단위·baseline) → D5 규칙7, D1 §7.3
