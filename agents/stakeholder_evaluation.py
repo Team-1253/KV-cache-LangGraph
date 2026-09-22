@@ -283,24 +283,33 @@ def run_technology_assessment(
 def calculate_total_score(
     criteria: list[CriterionAssessment],
     rubric: dict[str, Any],
-) -> float | None:
-    """루브릭의 배점 정보를 이용해 100점 환산 총점을 계산한다."""
-
-    if any(item["status"] == "NOT_VERIFIED" for item in criteria):
-        return None
-
-    scores = [
-        item["score"]
-        for item in criteria
-        if item["score"] is not None
-    ]
+) -> float:
+    """NOT_VERIFIED를 0점으로 처리해 100점 환산 총점을 계산한다."""
 
     scoring = rubric["scoring"]
+
     item_count = scoring["item_count"]
     maximum_item_score = max(scoring["item_score_range"])
     maximum_total = item_count * maximum_item_score
 
-    return round(sum(scores) / maximum_total * 100, 1)
+    missing_policy = scoring.get("missing_data_policy", {})
+    penalty_value = missing_policy.get(
+        "penalty_calculation_value",
+        0,
+    )
+
+    scores = [
+        item["score"]
+        if item["status"] == "VERIFIED"
+        and item["score"] is not None
+        else penalty_value
+        for item in criteria
+    ]
+
+    return round(
+        sum(scores) / maximum_total * 100,
+        1,
+    )
 
 
 def prepare_assessment_for_state(
@@ -350,10 +359,22 @@ def prepare_assessment_for_state(
         rubric=rubric,
     )
 
+    verified_count = sum(
+        criterion["status"] == "VERIFIED"
+        for criterion in assessment["criteria"]
+    )
+
+    coverage = round(
+        verified_count / len(assessment["criteria"]) * 100,
+        1,
+    )
+
     state_result = {
         "technology": assessment["technology"],
         "criteria": normalized_criteria,
+        "score": total_score,
         "total_score": total_score,
+        "coverage": coverage,
         "summary": assessment["summary"],
     }
 
