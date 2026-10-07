@@ -103,6 +103,7 @@ LLM은 토큰을 하나씩 생성하면서 앞서 계산한 Key-Value를 저장�
 | 🤝 이해관계자 평가 | 경쟁사 반응·도입 장벽·개발자 생태계·투자 동향         | X   | `stakeholder_result`, `references` |
 | 🏭 도메인 평가     | 데이터센터 적용 적합성 및 근거 신뢰도                 | O   | `domain_result`, `references`      |
 | 📝 Synthesizer     | 관점 간 종합 분석과 보고서 작성·저장                  | X   | `report_uri`                       |
+| ✅ 품질 검증       | 근거성·중립성·편향 통제·관점 커버리지 검사            | X   | `quality`, `status`, `errors`      |
 
 각 평가 함수는 기존 결과 형식의 dict를 반환한다.
 `Send`가 작업마다 `WorkerState` 입력을 전달하고, Worker는 부모의 `results`에 결과를 반환한다.
@@ -124,7 +125,10 @@ Orchestrator는 실제 기술 조사 결과와 평가 목표를 읽고, LLM의 �
 `langgraph-v1/12-Pattern/04-Orchestrator-Workers.ipynb`의 계획 → `Send` → Worker → Synthesizer 연결을 사용한다.
 Synthesizer는 `results`를 읽고 `with_structured_output`으로 종합 분석과 보고서 서술을 한 번에 받는다.
 `agents/synthesizer.py`의 함수를 그래프에 직접 등록하며, 점수·측정값·각주 조립은 기존 코드를 사용한다.
-보고서 품질 평가·재작업·반복 상한 제어는 다음 단계에서 연결한다.
+품질 검증은 `report_uri`의 보고서와 `results`의 원자료를 대조하고 `quality`에 네 항목과 피드백을 기록한다.
+미달 시 Synthesizer에 이전 보고서와 피드백을 전달해 수정한다. 조사·평가 Worker는 다시 실행하지 않는다.
+`step_count`는 보고서 생성 횟수이며 `max_steps`의 기본값은 2다(초안 + 수정 1회).
+수정 후에도 품질 미달이면 `PARTIAL`, 생성·품질 검사 실패 시 `FAILED`로 종료한다.
 원문과 대량 결과의 외부 저장·체크포인트 크기 제한도 아직 연결하지 않았다.
 
 ### 설계 원칙
@@ -141,7 +145,7 @@ Synthesizer는 `results`를 읽고 `with_structured_output`으로 종합 분석�
 네 관점은 출력 계약 문서의 공통 결과·항목·출처 형식을 사용한다. coverage는 모두 0~1이며
 척도 자체는 통일하지 않는다. 취합·보고서는 실제 근거의 `reference_id`로 출처 내용을 함께 읽는다.
 보고서의 점수·coverage·판정과 측정값의 baseline·조건은 원자료에서 직접 싣고, 본문에서 사용한 출처만 REFERENCE에 남긴다.
-보고서 해석은 구조화 출력으로 한 번 생성한다. 호출 실패 시에는 확보한 자료를 담은 대체 보고서를 남긴다.
+보고서 해석은 생성 시마다 구조화 출력으로 한 번 받는다. 호출 실패 시에는 확보한 자료를 담은 대체 보고서를 남긴다.
 
 모든 에이전트는 `prompts/`의 마크다운을 시스템 메시지로 사용한다. 기술 조사·TRL은 같은 파일의 역할별 블록을 사용한다.
 노드 실행 오류는 공통 실행 경계에서 기록하고 다음 단계로 진행하며, 모듈 import 오류는 시작 시 드러난다.
@@ -155,7 +159,9 @@ graph TD;
     OR -->|작업별 Send| WK[Worker: 배정된 기술과 관점 평가]
     WK -->|operator.add 결과 누적| SY[Synthesizer: 종합·보고서]
     OR -->|작업 없음| SY
-    SY --> END([END])
+    SY --> Q[품질 검증]
+    Q -->|미달·생성 상한 이내| SY
+    Q -->|통과·상한 도달·검사 오류| END([END])
 ```
 
 기술 조사가 두 기술의 원문에서 구조·성능·범위·한계를 추출하면,
@@ -173,7 +179,8 @@ graph TD;
 │   ├── market_evaluation.py
 │   ├── stakeholder_evaluation.py
 │   ├── domain_evaluation.py
-│   └── synthesizer.py             # 평가 종합·보고서 생성·저장
+│   ├── synthesizer.py             # 평가 종합·보고서 생성·저장
+│   └── report_quality.py          # 품질 검사와 수정 여부 결정
 ├── rag/                           # 공용 RAG 파이프라인
 │   ├── loader.py                  # PyPDFLoader
 │   ├── chunking.py                # 표 보존 청킹
@@ -202,6 +209,7 @@ LangSmith는 교재의 `langchain_teddynote.logging.langsmith`로 연결한다.
 `.env`의 `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT=KV-Cache-Report`를 설정한다.
 `run_evaluation()`이 State의 `run_id`를 루트 Trace ID와 metadata에 함께 전달한다.
 LangSmith에서 해당 실행을 열면 Orchestrator의 작업 목록·배정 이유와 각 Worker의 입출력을 확인할 수 있다.
+`report_quality`의 출력에서 최종 품질 판정을 확인하며, 재작성 시 같은 Trace에 Synthesizer와 품질 검사가 한 번 더 나타난다.
 로컬에서 추적 없이 실행하려면 `LANGSMITH_TRACING=false`로 설정한다.
 
 검색 품질은 골든 QA로 재현 가능함.

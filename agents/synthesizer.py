@@ -1,6 +1,7 @@
 """Worker 결과를 한 번의 모델 호출로 분석하고 최종 보고서를 저장한다."""
 
 import json
+import re
 from pathlib import Path
 
 from langchain.chat_models import init_chat_model
@@ -19,6 +20,11 @@ LABELS = {
     "stakeholder": "이해관계자",
     "domain": "도메인 적용성",
 }
+STATUS_LABELS = {
+    "VERIFIED": "확인됨",
+    "NOT_VERIFIED": "미확인",
+    "PARTIAL": "일부 확인",
+}
 
 
 class Paragraph(BaseModel):
@@ -31,6 +37,11 @@ class Paragraph(BaseModel):
         max_length=5,
         description="이 문단의 주장을 직접 뒷받침하는 입력 references의 id만 최대 5개. 전체 출처 목록을 복사하지 않는다.",
     )
+
+
+class CriterionRationale(BaseModel):
+    key: str = Field(description="입력 평가 항목의 report_key를 그대로 반환한다.")
+    text: str = Field(description="해당 평가 항목의 판단 이유와 한계를 한국어 평서체로 작성한다.")
 
 
 class ReportNarrative(BaseModel):
@@ -49,6 +60,9 @@ class ReportNarrative(BaseModel):
     )
     limitations: Paragraph = Field(
         description="관점별 coverage·미확인 항목·측정 조건에서 한계를 도출하고 해당 근거 출처를 인용한다. 도메인 판정 보류와 상용 채택 근거의 한계를 반드시 구분한다."
+    )
+    criterion_rationales: list[CriterionRationale] = Field(
+        description="evaluations의 모든 criteria에 대해 report_key를 key로, 한국어 서술을 text로 반환한다. 확인된 항목은 핵심 판단 이유와 한계를 2~3문장으로 압축한다. 미확인 항목은 미확인인 대상과 사유를 1문장으로 작성한다. 점수 산정에 필요한 수치·비교 대상·조건은 유지하며 점수와 확인 상태를 변경하지 않는다. text에 원문 발췌, 내부 출처 ID, 각주, 상태 코드는 넣지 않는다. 기술명과 약어는 유지할 수 있다."
     )
 
 
@@ -96,9 +110,19 @@ def synthesizer(state: OrchestratorState) -> dict:
     """교재처럼 results를 읽어 종합·보고서 생성을 한 노드에서 수행한다."""
 
     material = evaluation_material(state)
+    material["evaluations"] = [
+        {**result, "criteria": [
+            {**criterion, "report_key": f"evaluation_{i}_criterion_{j}"}
+            for j, criterion in enumerate(result["criteria"])
+        ]}
+        for i, result in enumerate(material["evaluations"])
+    ]
     errors = []
     status = "PARTIAL" if state.get("errors") else "SUCCESS"
     try:
+        if state.get("quality"):
+            material["previous_report"] = Path(state["report_uri"]).read_text(encoding="utf-8")
+            material["quality_feedback"] = state["quality"]
         model = init_chat_model(
             "gpt-5.6-luna", model_provider="openai", reasoning_effort="low",
             use_responses_api=True, temperature=0, timeout=90, max_retries=2,
@@ -124,22 +148,42 @@ def synthesizer(state: OrchestratorState) -> dict:
 
 
 def render_report(narrative: ReportNarrative, material: dict) -> str:
-    """서술에 기존 점수·측정값·각주를 원자료 그대로 붙인다."""
+    """기존 보고서 형식과 점수·측정값·출처를 보존한다."""
 
     references = {ref["id"]: ref for ref in material["references"]}
-    used_ids = set()
+    rationales = {item.key: item.text.strip() for item in narrative.criterion_rationales}
+    citation_numbers = {}
+    bibliography_refs = {}
+
+    def prose(text):
+        # 원자료에 붙은 내부 ID는 본문 각주와 중복되므로 제거한다.
+        for ref_id in references:
+            text = text.replace(ref_id, "")
+        text = re.sub(r"\(\s*[,\s]*\)", "", text)
+        return text.strip()
 
     def citations(ids):
-        """유효한 출처 ID로 각주를 만들고 본문에 사용된 출처를 기록한다."""
+        """유효한 출처에 최초 인용 순서대로 각주 번호를 부여한다."""
 
         valid = list(dict.fromkeys(ref_id for ref_id in ids if ref_id in references))
-        used_ids.update(valid)
-        return " ".join(f"[^{ref_id}]" for ref_id in valid)
+        markers = []
+        for ref_id in valid:
+            ref = references[ref_id]
+            # URL이 없는 출처는 서로 다른 문헌일 수 있으므로 ID별로 유지한다.
+            key = ref["url"] or ref_id
+            if key not in citation_numbers:
+                citation_numbers[key] = len(citation_numbers) + 1
+                bibliography_refs[key] = ref
+            page = f" (p. {ref['page']})" if ref["page"] is not None else ""
+            marker = f"[^{citation_numbers[key]}]{page}"
+            if marker not in markers:
+                markers.append(marker)
+        return " ".join(markers)
 
     sections = []
 
     for title, paragraph in (
-        ("SUMMARY", narrative.summary),
+        ("요약", narrative.summary),
         ("1. 분석 배경", narrative.background),
         ("2. 기술 선정", narrative.selection),
         ("3. 기술 개요", narrative.overview),
@@ -149,21 +193,6 @@ def render_report(narrative: ReportNarrative, material: dict) -> str:
         )
 
     # 모델의 재서술로 점수·측정값·비교 조건이 달라지지 않도록 표와 항목은 직접 구성한다.
-    measurements = [
-        "### 원문 측정값",
-        "",
-        "| 기술 | 지표·값 | baseline | 조건 | 출처 |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for profile in material["technical_result"].values():
-        for measurement in profile["measurements"]:
-            ref_id = measurement["source"]["reference_id"]
-            measurements.append(
-                f"| {profile['title']} | {measurement['metric']}: {measurement['value']} "
-                f"| {measurement['baseline']} | {measurement['condition']} | {citations([ref_id])} |"
-            )
-    sections[-1] += "\n\n" + "\n".join(measurements)
-
     evaluation_text = ["## 4. 관점별 평가"]
     for result in material["evaluations"]:
         score = result["score"]
@@ -176,7 +205,7 @@ def render_report(narrative: ReportNarrative, material: dict) -> str:
         evaluation_text.extend(
             [
                 f"\n### {result['technology']} — {LABELS[result['perspective']]}",
-                f"\n점수: **{display} ({result['score_scale']})** · 근거 coverage: **{result['coverage']:.0%}** · {result['verdict'] or result['status']}",
+                f"\n점수: **{display} ({result['score_scale']})** · 근거 확보율: **{result['coverage']:.0%}** · {STATUS_LABELS.get(result['verdict'] or result['status'], result['verdict'] or result['status'])}",
             ]
         )
 
@@ -187,26 +216,12 @@ def render_report(narrative: ReportNarrative, material: dict) -> str:
             )
 
         for criterion in result["criteria"]:
+            rationale = rationales.get(criterion["report_key"]) or criterion["rationale"]
             ids = [e["reference_id"] for e in criterion["evidence"]]
             item_score = "미확인" if criterion["score"] is None else criterion["score"]
             evaluation_text.append(
-                f"\n- **{criterion['name']}**: {item_score} ({criterion['status']}). {criterion['rationale']} {citations(ids)}"
+                f"\n- **{criterion['name']}**: {item_score} ({STATUS_LABELS.get(criterion['status'], criterion['status'])}). {prose(rationale)} {citations(ids)}"
             )
-            if criterion["metadata"].get("confidence_tag"):
-                evaluation_text.append(
-                    f"  근거 신뢰도: {criterion['metadata']['confidence_tag']}, 검색 시도: {criterion['metadata']['attempts']}회."
-                )
-
-            for evidence in criterion["evidence"]:
-                if evidence["text"] != criterion["rationale"]:
-                    text = evidence["text"].replace("\n", " ")
-                    evaluation_text.append(
-                        f"  근거 요지: {text[:350]}{'…' if len(text) > 350 else ''} {citations([evidence['reference_id']])}"
-                    )
-                if evidence.get("value"):
-                    evaluation_text.append(
-                        f"  수치: {evidence['value']} {evidence.get('unit', '')}, baseline: {evidence.get('baseline', '')}, 조건: {evidence.get('condition', '')}."
-                    )
 
     sections.append("\n".join(evaluation_text))
 
@@ -218,14 +233,26 @@ def render_report(narrative: ReportNarrative, material: dict) -> str:
             f"## {title}\n\n{paragraph.text} {citations(paragraph.reference_ids)}"
         )
 
-    bibliography = ["## REFERENCE"]
-    for ref_id in references:
-        if ref_id in used_ids:
-            ref = references[ref_id]
-            page = f", p. {ref['page']}" if ref["page"] is not None else ""
-            bibliography.append(
-                f"[^{ref_id}]: {ref['title']} ({ref['date'] or '시점 미확인'}{page}). {ref['url']}"
+    measurements = [
+        "### 원문 측정값",
+        "",
+        "| 기술 | 지표·값 | 비교 기준 | 조건 | 출처 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for profile in material["technical_result"].values():
+        for measurement in profile["measurements"]:
+            ref_id = measurement["source"]["reference_id"]
+            measurements.append(
+                f"| {profile['title']} | {measurement['metric']}: {measurement['value']} "
+                f"| {measurement['baseline']} | {measurement['condition']} | {citations([ref_id])} |"
             )
+
+    bibliography = ["## REFERENCE", "\n".join(measurements)]
+    for key, number in citation_numbers.items():
+        ref = bibliography_refs[key]
+        bibliography.append(
+            f"[^{number}]: {ref['title']} ({ref['date'] or '시점 미확인'}). {ref['url']}"
+        )
 
     sections.append("\n\n".join(bibliography))
 

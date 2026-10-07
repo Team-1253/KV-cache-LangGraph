@@ -45,6 +45,7 @@ work/
 | 이해관계자 평가 | `technical_result` | `stakeholder_result`, `references` |
 | 도메인 평가 | `technical_result`, `target_domain` | `domain_result`, `references` |
 | Synthesizer | 부모의 `results`, `target_domain`, `background_facts` | `report_uri`, `status`, `errors` |
+| 품질 검증 | `report_uri`, 부모의 `results` | `quality`, `status`, `errors` |
 
 평가 함수의 결과와 `references`는 `results[].output`에 함께 저장합니다.
 `agents/state.py`의 reducer가 `results`를 누적하고, Synthesizer가 관련 출처를 읽습니다.
@@ -60,6 +61,7 @@ START
   -> Orchestrator: 조사 결과를 읽고 기술 범위·평가 지시·배정 이유 계획
   -> 작업별 Send: 배정된 기술과 관점 평가
   -> Synthesizer: 종합·보고서 생성·저장
+  -> 품질 검증: 미달 시 Synthesizer로 돌아가 수정 1회, 통과·상한 도달·검사 오류 시 종료
   -> END
 ```
 
@@ -68,7 +70,8 @@ START
 - 각 Worker가 자신에게 할당된 관점의 결과를 반환한다.
 - SW와 HW 기술 결과가 모두 포함된다.
 - 평가 점수와 판단 근거가 함께 저장된다.
-- 보고서가 `SUMMARY`로 시작하고 `REFERENCE`로 끝난다.
+- 보고서에 `요약`과 `REFERENCE`가 포함된다.
+- 네 품질 항목과 피드백을 기록하며, 미달 보고서는 최대 1회 수정한다.
 - 기술의 우열이나 단일 승자를 결정하지 않는다.
 
 

@@ -18,9 +18,9 @@ class OrchestratorState(TypedDict, total=False):
     errors: Annotated[list, operator.add]
 
     run_id: str
-    step_count: int
-    max_steps: int
-    # quality 항목: groundedness, neutrality, bias_control, coverage, feedback
+    step_count: int  # 보고서 생성 횟수
+    max_steps: int   # 보고서 생성 상한. 기본 2회(초안 + 수정 1회)
+    # quality 항목: groundedness, neutrality, bias_control, perspective_coverage, feedback
     quality: dict
 
 

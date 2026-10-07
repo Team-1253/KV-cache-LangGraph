@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from agents.domain_evaluation import domain_evaluation_agent
 from agents.market_evaluation import market_evaluation_agent
 from agents.resilient import error_record
+from agents.report_quality import report_quality_agent, route_report_quality
 from agents.stakeholder_evaluation import stakeholder_evaluation_agent
 from agents.state import OrchestratorState, WorkerState
 from agents.synthesizer import synthesizer
@@ -115,11 +116,16 @@ def build_graph():
     builder.add_node("orchestrator", orchestrator)
     builder.add_node("worker", worker)
     builder.add_node("synthesizer", synthesizer)
+    builder.add_node("report_quality", report_quality_agent)
     builder.add_edge(START, "technical_research")
     builder.add_edge("technical_research", "orchestrator")
     builder.add_conditional_edges("orchestrator", assign_workers, ["worker", "synthesizer"])
     builder.add_edge("worker", "synthesizer")
-    builder.add_edge("synthesizer", END)
+    builder.add_edge("synthesizer", "report_quality")
+    builder.add_conditional_edges(
+        "report_quality", route_report_quality,
+        {"retry": "synthesizer", "end": END},
+    )
     return builder.compile()
 
 
@@ -133,7 +139,7 @@ def run_evaluation(inputs: OrchestratorState) -> OrchestratorState:
     )
     run_id = UUID(inputs["run_id"]) if inputs.get("run_id") else uuid4()
     return build_graph().invoke(
-        {**inputs, "run_id": str(run_id)},
+        {"max_steps": 2, **inputs, "run_id": str(run_id)},
         config={"run_id": run_id, "run_name": "KV-Cache-Orchestrator-Workers",
                 "metadata": {"run_id": str(run_id), "pattern": "orchestrator-workers"}},
     )
@@ -147,4 +153,6 @@ if __name__ == "__main__":
     print(Path(result["report_uri"]).read_text(encoding="utf-8"))
     print(f"보고서 저장 위치: {result['report_uri']}")
     print(f"LangSmith 실행 ID: {result['run_id']}")
+    print("최종 상태:", result["status"])
+    print("보고서 품질 평가:", result["quality"])
     wait_for_all_tracers()

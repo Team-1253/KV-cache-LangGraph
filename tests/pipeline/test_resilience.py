@@ -33,12 +33,13 @@ def test_unknown_report_reference_is_not_in_the_bibliography(monkeypatch, orches
     class BadReferenceModel(Model):
         def structured(self, schema, messages):
             return schema(**{field: synthesis.Paragraph(text="확보된 자료의 해석", reference_ids=["invented-id"])
-                             for field in schema.model_fields})
+                             for field in schema.model_fields if field != "criterion_rationales"},
+                          criterion_rationales=[])
     monkeypatch.setattr(synthesis, "init_chat_model", lambda *args, **kwargs: BadReferenceModel())
     result = synthesis.synthesizer(orchestrator_state)
     text = Path(result["report_uri"]).read_text()
     assert "invented-id" not in text
-    assert "[^market-" in text
+    assert "[^1]:" in text
 
 
 def test_report_failure_preserves_the_actual_input(monkeypatch, orchestrator_state):
