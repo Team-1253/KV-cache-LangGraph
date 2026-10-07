@@ -28,18 +28,15 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agents.market_evaluation import (  # noqa: E402
-    EvidenceJudgement,
-    MarketDeps,
-    RubricScore,
-    load_rubric,
-    run_market_evaluation,
-)
+from unittest.mock import patch
+from contextlib import ExitStack
+from types import SimpleNamespace
+from agents import market_evaluation as market  # noqa: E402
 from agents.state import EvaluationState  # noqa: E402
 
 
 def _source(chunk_id: str, page: int) -> dict:
-    return {"chunk_id": chunk_id, "page": page}
+    return {"chunk_id": chunk_id, "page": page, "reference_id": f"technical-{chunk_id}"}
 
 
 def sample_state() -> EvaluationState:
@@ -62,7 +59,7 @@ def sample_state() -> EvaluationState:
                 "claims": [
                     {
                         "text": "93.3% KV cache reduction",
-                        "baseline": "MHA",
+                        "baseline": "DeepSeek 67B",
                         "source": _source("c3", 1),
                     }
                 ],
@@ -70,7 +67,7 @@ def sample_state() -> EvaluationState:
                     {
                         "metric": "KV cache",
                         "value": "93.3%",
-                        "baseline": "MHA",
+                        "baseline": "DeepSeek 67B",
                         "condition": "long context",
                         "source": _source("c3", 5),
                     }
@@ -113,24 +110,20 @@ def sample_state() -> EvaluationState:
     return cast(EvaluationState, payload)
 
 
-def fake_deps() -> MarketDeps:
-    def web_search(query, **kwargs):
-        return [
-            {
-                "title": "fixture result",
-                "url": "https://example.com/fixture",
-                "content": f"fixture content for: {query}",
-                "published_date": "2024-05",
-            }
-        ]
+class FakeSearch:
+    def __init__(self, **kwargs):
+        pass
 
-    def judge_evidence(system_prompt, criterion, technology, results):
-        return EvidenceJudgement(evidence_score=4, reason="fixture")
+    def invoke(self, request):
+        return {"results": [{"title": "fixture result", "url": "https://example.com/fixture",
+                             "content": "fixture content", "published_date": "2024-05"}]}
 
-    def score_rubric(system_prompt, criterion, technology, results, evidence_score):
-        return RubricScore(score=4, rationale="fixture rationale")
 
-    return MarketDeps(web_search, judge_evidence, score_rubric)
+class FakeModel:
+    def with_structured_output(self, schema):
+        result = (schema(evidence_score=4, reason="fixture") if schema is market.EvidenceJudgement
+                  else schema(score=4, rationale="fixture rationale", source_indices=[1], evidence=[]))
+        return SimpleNamespace(invoke=lambda messages: result)
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,18 +154,16 @@ def main() -> int:
             if k in wanted
         }
 
-    criteria = load_rubric().get("criteria", [])
+    criteria = json.loads(market.RUBRIC_PATH.read_text(encoding="utf-8"))["criteria"]
     if args.items:
         wanted_items = {i.strip() for i in args.items.split(",") if i.strip()}
         criteria = [c for c in criteria if c.get("id") in wanted_items]
 
-    deps = fake_deps() if args.fake else None
-    if deps is None:
-        from agents.market_evaluation import default_deps
-
-        deps = default_deps()
-
-    result = run_market_evaluation(state, deps, criteria)
+    with ExitStack() as stack:
+        if args.fake:
+            stack.enter_context(patch.object(market, "TavilySearch", FakeSearch))
+            stack.enter_context(patch.object(market, "init_chat_model", return_value=FakeModel()))
+        result = market.market_evaluation_agent(state, criteria)
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
