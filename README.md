@@ -194,7 +194,7 @@ python app.py
 | 학번 | 이름 | 수행 역할 |
 | --- | --- | --- |
 | P318 | 김인성 |  |
-| P336 | 이윤서 | codex: state schema 정리|
+| P336 | 이윤서 | state schema 정리|
 | P343 | 함형준 | 전체 코드 간소화 리팩토링, 보고서 출력 형식 개선 |
 | P344 | 황영준 | README.md 수정, LangSmith 정리 |
 | P346 | 황정현 |  |
