@@ -1,16 +1,18 @@
 """실제 노드 연결에서 공통 평가·출처 계약과 프롬프트 사용을 확인한다."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.documents import Document
+from langchain_core.callbacks import BaseCallbackHandler
 
 import app
 from agents import technical_research as technical, domain_evaluation as domain
 from agents import market_evaluation as market, stakeholder_evaluation as stakeholder
-from agents import evaluation_synthesis as synthesis, report_generation as report
-from agents.state import PerspectiveResult, Criterion, Reference, evaluation_material
+from agents import synthesizer as synthesis
+from agents.synthesizer import evaluation_material
 
 
 class Retriever:
@@ -37,11 +39,18 @@ class Search:
 class Model:
     calls = []
 
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, **kwargs):
         return SimpleNamespace(invoke=lambda messages: self.structured(schema, messages))
 
     def structured(self, schema, messages):
         self.calls.append((schema, messages))
+        if schema is app.Plan:
+            research = json.loads(messages[1].content)["technical_result"]
+            tasks = [{"worker": key, "tech_ids": [tech_id],
+                      "instruction": f"{tech_id}의 {key} 근거를 평가", "reason": "기술별 근거가 달라 분리"}
+                     for tech_id in research
+                     for key in ("trl_result", "market_result", "stakeholder_result", "domain_result")]
+            return schema(tasks=getattr(self, "planned_tasks", tasks))
         request = messages[1].content
         tech_id = "itme" if "ITME" in request else "deepseek_v2_mla"
         source = technical._Source(chunk_id=f"{tech_id}-0000", page=2)
@@ -67,22 +76,20 @@ class Model:
         if schema is domain.DomainAssessment:
             return schema(**{field: domain.CriterionResult(status="EVALUATED", score=1, rationale="source evidence",
                 evidence=[domain.Evidence(source=f"{tech_id}-0000", quote="source evidence")]) for field in domain.FIELDS.values()})
-        if schema is report.ReportNarrative:
+        if schema is synthesis.ReportNarrative:
             material = json.loads(request)
             ids = [ref["id"] for ref in material["references"]]
-            return schema(**{field: report.Paragraph(text="근거에 따른 해석", reference_ids=ids[:1]) for field in schema.model_fields})
+            return schema(**{field: synthesis.Paragraph(text="근거에 따른 해석", reference_ids=ids[:1]) for field in schema.model_fields})
         raise AssertionError(schema)
 
-    def invoke(self, messages):
-        self.calls.append((None, messages))
-        return SimpleNamespace(content='{"관찰": "관점별 점수를 합산하지 않는다"}')
 
 
 @pytest.fixture
-def offline_models(monkeypatch):
+def offline_models(monkeypatch, tmp_path):
+    monkeypatch.setattr(synthesis, "OUTPUT_DIR", tmp_path)
     model = Model()
     model.calls = []
-    for module in (technical, domain, market, stakeholder, synthesis, report):
+    for module in (app, technical, domain, market, stakeholder, synthesis):
         monkeypatch.setattr(module, "init_chat_model", lambda *args, **kwargs: model)
     for module in (technical, domain):
         monkeypatch.setattr(module, "TechRetriever", Retriever)
@@ -96,22 +103,145 @@ def offline_models(monkeypatch):
 
 @pytest.fixture
 def completed_state(offline_models):
+    # 개별 평가 함수의 기존 dict 계약 검증에 사용하는 입력이다.
+    orchestrator_state = app.build_graph().invoke({
+        "selected_technologies": {"sw": "DeepSeek-V2 MLA", "hw": "ITME"},
+        "target_domain": "데이터센터",
+    })
+    data = {**orchestrator_state, "references": []}
+    references = []
+    for result in orchestrator_state["results"]:
+        for key, value in result["output"].items():
+            if key.endswith("_result"):
+                data.setdefault(key, {}).update(value)
+        references.extend(result["output"].get("references", []))
+    data["references"] = references
+    data["run_errors"] = orchestrator_state.get("errors", [])
+    data["final_report"] = Path(orchestrator_state["report_uri"]).read_text()
+    return data
+
+
+@pytest.fixture
+def orchestrator_state(offline_models):
     return app.build_graph().invoke({"selected_technologies": {"sw": "DeepSeek-V2 MLA", "hw": "ITME"},
-                                     "target_domain": "데이터센터", "references": []})
+                                     "target_domain": "데이터센터"})
+
+
+def test_parent_collects_results_without_worker_input_fields(orchestrator_state):
+    state = orchestrator_state
+    assert not {"technical_result", "market_result", "references", "final_report"} & state.keys()
+    assert not {"task", "worker", "messages", "task_input", "task_output", "last_error"} & state.keys()
+    assert len(state["results"]) == 9
+    assert all(result["status"] == "SUCCESS" and isinstance(result["output"], dict)
+               for result in state["results"])
+    assert "## REFERENCE" in Path(state["report_uri"]).read_text()
+    assert state["step_count"] == 1
+
+
+def test_worker_failure_preserves_other_results(monkeypatch, offline_models):
+    def failed_market(data):
+        raise ConnectionError("market unavailable")
+    monkeypatch.setitem(app.AGENTS, "market_result", failed_market)
+    state = app.build_graph().invoke({"target_domain": "데이터센터"})
+    results = {result["task"]["worker"]: result for result in state["results"]}
+    assert results["market_result"]["status"] == "FAILED"
+    assert all(results[key]["status"] == "SUCCESS"
+               for key in ("trl_result", "stakeholder_result", "domain_result"))
+    assert results["market_result"]["output"]["market_result"] == {}
+    assert len(results["stakeholder_result"]["output"]["stakeholder_result"]) == 1
+    assert "ConnectionError" in Path(state["report_uri"]).read_text()
+
+
+def test_parallel_results_are_accumulated_before_one_synthesis(offline_models):
+    offline_models.planned_tasks = [
+        {"worker": "market_result", "tech_ids": [tech_id], "instruction": "시장 근거 확인", "reason": "기술별 평가"}
+        for tech_id in ("deepseek_v2_mla", "itme")
+    ]
+    state = app.build_graph().invoke({})
+    markets = [result for result in state["results"] if result["task"]["worker"] == "market_result"]
+    assert len(markets) == 2
+    assert len({result["task_id"] for result in markets}) == 2
+    assert len(state["results"]) == 3
+    assert sum(schema is synthesis.ReportNarrative for schema, _ in offline_models.calls) == 1
+
+
+def test_worker_evaluates_only_the_assigned_technology_and_instruction(offline_models):
+    instruction = "ITME 상용 채택의 독립 근거 확인"
+    offline_models.planned_tasks = [{
+        "worker": "market_result", "tech_ids": ["itme"],
+        "instruction": instruction, "reason": "상용화 근거 보완",
+    }]
+    state = app.build_graph().invoke({})
+    assert len(state["plan"]) == 1 and len(state["results"]) == 2
+    result = state["results"][1]
+    assert result["task"] == state["plan"][0]
+    assert set(result["output"]["market_result"]) == {"itme"}
+    assert all(ref["tech_id"] == "itme" for ref in result["output"]["references"])
+    for schema, messages in offline_models.calls:
+        if schema in (market.EvidenceJudgement, market.RubricScore):
+            payload = json.loads(messages[1].content.split("\n", 1)[1])
+            assert payload["instruction"] == instruction
+            assert payload["technology"].startswith("ITME")
+
+
+def test_plan_can_group_technologies_without_losing_evaluations(offline_models):
+    offline_models.planned_tasks = [
+        {"worker": key, "tech_ids": ["deepseek_v2_mla", "itme"],
+         "instruction": "동일 관점으로 두 기술의 근거 평가", "reason": "평가 목표가 같아 묶음"}
+        for key in ("trl_result", "market_result", "stakeholder_result", "domain_result")
+    ]
+    state = app.build_graph().invoke({"target_domain": "데이터센터"})
+    assert len(state["plan"]) == 4 and len(state["results"]) == 5
+    for result in state["results"][1:]:
+        assert set(result["output"][result["task"]["worker"]]) == {"deepseek_v2_mla", "itme"}
+    assert len(evaluation_material(state)["evaluations"]) == 8
+    assert sum(schema is synthesis.ReportNarrative for schema, _ in offline_models.calls) == 1
+
+
+def test_orchestrator_sees_the_research_and_preserves_task_reasons(orchestrator_state, offline_models):
+    messages = next(messages for schema, messages in offline_models.calls if schema is app.Plan)
+    research = json.loads(messages[1].content)["technical_result"]
+    assert set(research) == {"deepseek_v2_mla", "itme"}
+    assert research["itme"]["measurements"][0]["baseline"] == "DeepSeek 67B"
+    assert len(orchestrator_state["plan"]) == 8
+    assert all(task["instruction"] and task["reason"] for task in orchestrator_state["plan"])
+
+
+def test_run_evaluation_connects_state_id_to_native_trace_metadata(monkeypatch, offline_models):
+    starts = []
+
+    class CaptureTrace(BaseCallbackHandler):
+        def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None,
+                           metadata=None, **kwargs):
+            starts.append((run_id, parent_run_id, metadata))
+
+    monkeypatch.setattr(app, "load_dotenv", lambda *args, **kwargs: False)
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    graph = app.build_graph().with_config(callbacks=[CaptureTrace()])
+    monkeypatch.setattr(app, "build_graph", lambda: graph)
+    state = app.run_evaluation({"target_domain": "데이터센터"})
+    root = next(start for start in starts if start[1] is None)
+    assert str(root[0]) == state["run_id"]
+    assert all(metadata["run_id"] == state["run_id"] for _, _, metadata in starts)
+    assert root[2]["pattern"] == "orchestrator-workers"
 
 
 def test_all_perspectives_have_the_same_fields_and_real_references(completed_state):
     state = completed_state
     assert state.get("run_errors", []) == []
     references = {ref["id"]: ref for ref in state["references"]}
-    assert all(set(ref) == set(Reference.__annotations__) for ref in references.values())
+    reference_fields = {"id", "tech_id", "perspective", "title", "url", "date", "page", "content", "metadata"}
+    result_fields = {"tech_id", "technology", "perspective", "status", "score", "score_scale",
+                     "coverage", "summary", "verdict", "criteria", "metadata"}
+    criterion_fields = {"id", "name", "status", "score", "rationale", "evidence", "metadata"}
+    assert all(set(ref) == reference_fields for ref in references.values())
     for key in ("trl_result", "market_result", "stakeholder_result", "domain_result"):
         assert set(state[key]) == {"deepseek_v2_mla", "itme"}
         for evaluation in state[key].values():
-            assert set(evaluation) == set(PerspectiveResult.__annotations__)
+            assert set(evaluation) == result_fields
             assert 0 <= evaluation["coverage"] <= 1
             for criterion in evaluation["criteria"]:
-                assert set(criterion) == set(Criterion.__annotations__)
+                assert set(criterion) == criterion_fields
                 for evidence in criterion["evidence"]:
                     assert references[evidence["reference_id"]]["tech_id"] == evaluation["tech_id"]
     assert state["market_result"]["itme"]["score"] == 80
@@ -135,12 +265,13 @@ def test_report_connects_each_perspective_and_preserves_values(completed_state):
 def test_every_model_receives_its_markdown_prompt(completed_state, offline_models):
     sections = technical._prompt_sections()
     expected = {
+        app.Plan: app.PLANNER_PROMPT.read_text(),
         technical._Extraction: sections["SYSTEM"], technical._ImplicitLimits: sections["SYSTEM"],
         technical.TrlAssessment: sections["TRL_SYSTEM"],
         market.EvidenceJudgement: market.PROMPT_PATH.read_text(), market.RubricScore: market.PROMPT_PATH.read_text(),
         stakeholder.TechnologyAssessment: stakeholder.PROMPT_PATH.read_text(),
         domain.DomainAssessment: domain.PROMPT_PATH.read_text(),
-        report.ReportNarrative: report.PROMPT_PATH.read_text(), None: synthesis.PROMPT_PATH.read_text(),
+        synthesis.ReportNarrative: synthesis.PROMPT_PATH.read_text(),
     }
     seen = set()
     for schema, messages in offline_models.calls:

@@ -73,7 +73,7 @@ LLM은 토큰을 하나씩 생성하면서 앞서 계산한 Key-Value를 저장�
 
 - **Framework** : LangGraph (StateGraph, Fan-out / Fan-in)
 - **LLM/Generator** : gpt-4.1-mini (기술 조사·TRL·도메인) / gpt-5.6-luna (시장·이해관계자·보고서)
-- **LLM/Judge** : gpt-4.1-nano (평가 종합)
+- **LLM/Planner** : gpt-4.1-nano (Orchestrator)
 - **Retrieval** : FAISS — **Hit Rate@5 0.88, MRR 0.721** (골든 QA 25문항 기준)
 - **Embedding** : **BAAI/bge-m3** (오픈소스)
 - **PDF Loader** : PyPDFLoader
@@ -95,19 +95,37 @@ LLM은 토큰을 하나씩 생성하면서 앞서 계산한 Key-Value를 저장�
 
 ## Agents
 
-| Agent              | 역할                                                  | RAG | 출력 State Key                     |
+| Agent              | 역할                                                  | RAG | 주요 반환 키                       |
 | ------------------ | ----------------------------------------------------- | --- | ---------------------------------- |
 | 🔍 기술 조사       | 두 기술 원문에서 개요·메커니즘·범위·한계 추출         | O   | `technical_result`, `references`   |
 | 📐 TRL 평가        | 공개 근거 기반 기술 성숙도 **구간** 추정              | -   | `trl_result`, `references`         |
 | 📊 시장 평가       | 시장 규모·성장성, 경제적 가치, 채택 현황, 생태계 지지 | O   | `market_result`, `references`      |
 | 🤝 이해관계자 평가 | 경쟁사 반응·도입 장벽·개발자 생태계·투자 동향         | X   | `stakeholder_result`, `references` |
 | 🏭 도메인 평가     | 데이터센터 적용 적합성 및 근거 신뢰도                 | O   | `domain_result`, `references`      |
-| ⚖️ 평가 종합       | 관점 간 일치·불일치·trade-off 도출                    | X   | `evaluation_result`                |
-| 📝 보고서 생성     | 다관점 평가 보고서 작성                               | X   | `final_report`                     |
+| 📝 Synthesizer     | 관점 간 종합 분석과 보고서 작성·저장                  | X   | `report_uri`                       |
 
-각 Agent는 **자신이 생성한 State Key만 반환**하며, 병렬 Agent는 서로 다른 결과 키를 사용함.
-`references`는 복수 Node가 함께 추가하므로 reducer로 병합함.
+각 평가 함수는 기존 결과 형식의 dict를 반환한다.
+`Send`가 작업마다 `WorkerState` 입력을 전달하고, Worker는 부모의 `results`에 결과를 반환한다.
+`results` 항목은 `task_id`, `agent`, 배정된 `task`, 결과 dict(`output`), `status`를 갖는다.
+병렬 결과는 교재처럼 `Annotated[list, operator.add]`로 자동 누적한다.
+최종 보고서만 `outputs/<run_id>.md`에 저장한다.
 Agent 간 출력 계약은 `agents/TECHNICAL_RESULT_SCHEMA.md`, `agents/EVALUATION_RESULT_SCHEMA.md`에 문서화함.
+
+`agents/state.py`에는 `OrchestratorState`와 `WorkerState` 두 스키마만 정의한다.
+부모는 입력·계획·누적 결과·오류·보고서 위치를 관리한다.
+`WorkerState`는 배정된 `task`와 입력 dict(`task_input`)만 갖고, 결과는 부모의 `results`로 반환한다.
+별도 Worker 그래프나 중간 결과 파일은 만들지 않는다.
+Orchestrator는 실제 기술 조사 결과와 평가 목표를 읽고, LLM의 구조화된 `Plan`으로 작업을 계획한다.
+각 작업은 `worker`, `tech_ids`, `instruction`, `reason`을 가지며 실행 전에 `task_id`를 붙인다.
+기술별 근거와 평가 목표에 따라 작업을 나누거나 묶으므로 작업 수는 고정하지 않는다.
+`Send`는 배정된 기술의 조사 결과·출처와 작업 지시만 Worker에 전달한다.
+종합 단계는 누적된 결과를 읽는다.
+`Plan`은 계획 응답 형식이며, State는 두 개만 사용한다.
+`langgraph-v1/12-Pattern/04-Orchestrator-Workers.ipynb`의 계획 → `Send` → Worker → Synthesizer 연결을 사용한다.
+Synthesizer는 `results`를 읽고 `with_structured_output`으로 종합 분석과 보고서 서술을 한 번에 받는다.
+`agents/synthesizer.py`의 함수를 그래프에 직접 등록하며, 점수·측정값·각주 조립은 기존 코드를 사용한다.
+보고서 품질 평가·재작업·반복 상한 제어는 다음 단계에서 연결한다.
+원문과 대량 결과의 외부 저장·체크포인트 크기 제한도 아직 연결하지 않았다.
 
 ### 설계 원칙
 
@@ -120,7 +138,7 @@ Agent 간 출력 계약은 `agents/TECHNICAL_RESULT_SCHEMA.md`, `agents/EVALUATI
 우열 비교는 종합 Agent, 시장 현황은 시장 Agent, 적합성 판정은 도메인 Agent로 이관함.
 해당 단계에서의 누락이나 왜곡은 하류 네 관점에 그대로 전파되기 때문 임.
 
-네 관점은 `agents/state.py`의 공통 결과·항목·출처 형식을 사용한다. coverage는 모두 0~1이며
+네 관점은 출력 계약 문서의 공통 결과·항목·출처 형식을 사용한다. coverage는 모두 0~1이며
 척도 자체는 통일하지 않는다. 취합·보고서는 실제 근거의 `reference_id`로 출처 내용을 함께 읽는다.
 보고서의 점수·coverage·판정과 측정값의 baseline·조건은 원자료에서 직접 싣고, 본문에서 사용한 출처만 REFERENCE에 남긴다.
 보고서 해석은 구조화 출력으로 한 번 생성한다. 호출 실패 시에는 확보한 자료를 담은 대체 보고서를 남긴다.
@@ -133,35 +151,29 @@ Agent 간 출력 계약은 `agents/TECHNICAL_RESULT_SCHEMA.md`, `agents/EVALUATI
 ```mermaid
 graph TD;
     START([START]) --> TR[기술 조사]
-    TR --> TRL[TRL 평가]
-    TR --> MK[시장 평가]
-    TR --> SH[이해관계자 평가]
-    TR --> DM[도메인 평가]
-    TRL --> SY[평가 종합]
-    MK --> SY
-    SH --> SY
-    DM --> SY
-    SY --> RP[보고서 생성]
-    RP --> END([END])
+    TR --> OR[Orchestrator: 기술 범위·지시·이유 계획]
+    OR -->|작업별 Send| WK[Worker: 배정된 기술과 관점 평가]
+    WK -->|operator.add 결과 누적| SY[Synthesizer: 종합·보고서]
+    OR -->|작업 없음| SY
+    SY --> END([END])
 ```
 
 기술 조사가 두 기술의 원문에서 구조·성능·범위·한계를 추출하면,
-네 관점의 평가가 **병렬(Fan-out)** 로 수행됨. 각 결과는 서로 다른 State Key에 저장되어
-동시 갱신 충돌을 방지함. 모든 평가 완료 후 종합 Agent가 **Fan-in** 하여 관점 간 일치·불일치와
-trade-off를 도출하고, 보고서 Agent가 이를 최종 평가 보고서로 구성함.
+작업 목록의 평가가 `Send`로 **병렬(Fan-out)** 수행됨. Worker는 배정받은 입력으로 평가하고,
+완료 결과를 부모의 `results`에 병합함. 모든 평가 완료 후 Synthesizer가 **Fan-in** 하여
+관점 간 일치·불일치와 trade-off를 분석하고 최종 보고서를 작성·저장함.
 
 ## Directory Structure
 
 ```
 ├── data/                          # 원문 PDF 2건(65p) + 관점별 평가 루브릭 JSON
 ├── agents/                        # Agent 모듈 및 출력 스키마 계약 문서
-│   ├── state.py                   # 공용 State
+│   ├── state.py                   # Orchestrator·Worker State
 │   ├── technical_research.py      # 기술 조사 + TRL 평가
 │   ├── market_evaluation.py
 │   ├── stakeholder_evaluation.py
 │   ├── domain_evaluation.py
-│   ├── evaluation_synthesis.py
-│   └── report_generation.py
+│   └── synthesizer.py             # 평가 종합·보고서 생성·저장
 ├── rag/                           # 공용 RAG 파이프라인
 │   ├── loader.py                  # PyPDFLoader
 │   ├── chunking.py                # 표 보존 청킹
@@ -179,12 +191,18 @@ trade-off를 도출하고, 보고서 Agent가 이를 최종 평가 보고서로 
 ```bash
 uv venv .venv --python 3.11
 uv sync
-cp .env.example .env    # OPENAI_API_KEY, TAVILY_API_KEY 설정
-python app.py
+cp .env.example .env    # OPENAI_API_KEY, TAVILY_API_KEY, LANGSMITH_API_KEY 설정
+uv run python app.py
 ```
 
 > 전역 Python 환경에서 실행 시 의존성 충돌로 API 호출이 실패할 수 있으므로 **가상환경 사용을 권장함.**
 > 최초 실행 시 임베딩 모델(약 2.2GB)을 다운로드하고 FAISS 인덱스를 생성하며, 이후에는 캐시를 재사용함.
+
+LangSmith는 교재의 `langchain_teddynote.logging.langsmith`로 연결한다.
+`.env`의 `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT=KV-Cache-Report`를 설정한다.
+`run_evaluation()`이 State의 `run_id`를 루트 Trace ID와 metadata에 함께 전달한다.
+LangSmith에서 해당 실행을 열면 Orchestrator의 작업 목록·배정 이유와 각 Worker의 입출력을 확인할 수 있다.
+로컬에서 추적 없이 실행하려면 `LANGSMITH_TRACING=false`로 설정한다.
 
 검색 품질은 골든 QA로 재현 가능함.
 

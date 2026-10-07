@@ -11,7 +11,6 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from agents.state import EvaluationState
 from rag.retriever import TechRetriever, format_chunks
 
 MODEL_NAME = "gpt-4.1-mini"
@@ -236,7 +235,7 @@ FACT_FIELDS = (
 )
 
 
-def technical_research_agent(state: EvaluationState) -> dict:
+def technical_research_agent(state: dict) -> dict:
     """논문에서 기술 사실과 한계를 추출해 검색 청크의 출처를 연결한다."""
 
     prompts = _prompt_sections()
@@ -346,7 +345,7 @@ def technical_research_agent(state: EvaluationState) -> dict:
     return {"technical_result": results, "references": list(references.values())}
 
 
-def trl_evaluation_node(state: EvaluationState) -> dict:
+def trl_evaluation_node(state: dict) -> dict:
     """기술 조사 근거로 구성요소별 TRL을 추정하고 성숙도 구간을 반환한다."""
 
     prompts = _prompt_sections()
@@ -375,6 +374,7 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
                         profile=json.dumps(facts, ensure_ascii=False),
                         rubric=rubric,
                     )
+                    + f"\n배정된 작업: {state.get('instruction', '')}"
                 ),
             ]
         )
