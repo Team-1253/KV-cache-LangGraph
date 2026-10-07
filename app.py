@@ -1,25 +1,38 @@
 """Integrated LangGraph scaffold for the six team roles."""
 
 from langgraph.graph import END, START, StateGraph
+from dotenv import load_dotenv
+from pathlib import Path
 
+from agents.evaluation_synthesis import evaluation_synthesis_agent
+from agents.market_evaluation import market_evaluation_agent
 from agents.resilient import continuing_node
+from agents.report_generation import report_generation_agent
 from agents.state import EvaluationState
+from agents.stakeholder_evaluation import stakeholder_evaluation_agent
+from agents.technical_research import technical_research_agent, trl_evaluation_node
+from agents.domain_evaluation import domain_evaluation_agent
 
 
 def build_graph():
     builder = StateGraph(EvaluationState)
 
-    nodes = (
-        ("technical_research", "agents.technical_research", "technical_research_agent", "technical_result"),
-        ("trl_evaluation", "agents.technical_research", "trl_evaluation_node", "trl_result"),
-        ("market_evaluation", "agents.market_evaluation", "market_evaluation_agent", "market_result"),
-        ("stakeholder_evaluation", "agents.stakeholder_evaluation", "stakeholder_evaluation_agent", "stakeholder_result"),
-        ("domain_evaluation", "agents.domain_evaluation", "domain_evaluation_agent", "domain_result"),
-        ("evaluation_synthesis", "agents.evaluation_synthesis", "evaluation_synthesis_agent", "evaluation_result"),
-        ("report_generation", "agents.report_generation", "report_generation_agent", "final_report"),
+    builder.add_node(
+        "technical_research",
+        continuing_node(technical_research_agent, "technical_result"),
     )
-    for name, module, function, result_key in nodes:
-        builder.add_node(name, continuing_node(module, function, result_key))
+    builder.add_node("trl_evaluation", continuing_node(trl_evaluation_node, "trl_result"))
+    builder.add_node("market_evaluation", continuing_node(market_evaluation_agent, "market_result"))
+    builder.add_node(
+        "stakeholder_evaluation",
+        continuing_node(stakeholder_evaluation_agent, "stakeholder_result"),
+    )
+    builder.add_node("domain_evaluation", continuing_node(domain_evaluation_agent, "domain_result"))
+    builder.add_node(
+        "evaluation_synthesis",
+        continuing_node(evaluation_synthesis_agent, "evaluation_result"),
+    )
+    builder.add_node("report_generation", continuing_node(report_generation_agent, "final_report"))
 
     builder.add_edge(START, "technical_research")
     builder.add_edge("technical_research", "trl_evaluation")
@@ -44,6 +57,7 @@ def build_graph():
 
 
 if __name__ == "__main__":
+    load_dotenv(Path(__file__).resolve().parent / ".env")
     graph = build_graph()
     print(graph.get_graph().draw_mermaid())
 
@@ -53,6 +67,6 @@ if __name__ == "__main__":
         "references": [],
     })
     print(result["final_report"])
-    # save final_report to .../final_report.md
-    with open("outputs/final_report.md", "w", encoding="utf-8") as f:
-        f.write(result["final_report"])
+    output = Path(__file__).resolve().parent / "outputs" / "final_report.md"
+    output.parent.mkdir(exist_ok=True)
+    output.write_text(result["final_report"], encoding="utf-8")

@@ -30,7 +30,7 @@ technical_result: dict[tech_id, TechProfile]
 ### 항목 타입
 
 ```python
-Source      = {"chunk_id": str, "page": int}
+Source      = {"chunk_id": str, "page": int, "reference_id": str}
 Evidenced   = {"text": str, "source": Source}
 Claim       = {"text": str, "baseline": str, "source": Source}
 Measurement = {"metric": str, "value": str, "baseline": str,
@@ -62,7 +62,7 @@ ITME를 예로 들면, Abstract의 `1.80×`는 **NVMe-oF 대비**이고 §6.1의
 (ITME가 실제로 그렇습니다). **0건은 "한계가 없다"가 아니라 "논문이 밝히지 않았다"입니다.**
 
 **④ 모든 항목에 `source`가 붙어 있습니다.**
-근거 없는 항목은 파이프라인에서 폐기되므로, 살아남은 항목은 전부 추적 가능합니다.
+근거 없는 항목은 파이프라인에서 폐기되므로, 살아남은 항목은 전부 추적 가능합니다. `reference_id`로 공통 출처 목록의 원문 청크에 연결됩니다.
 평가 결과에 근거를 달 때 `chunk_id`/`page`를 그대로 인용하시면 됩니다.
 
 ### `retrieval` 통계
@@ -78,40 +78,18 @@ ITME를 예로 들면, Abstract의 `1.80×`는 **NVMe-oF 대비**이고 §6.1의
 
 ## 2. `trl_result` — TRL 평가 Node 출력
 
-```python
-trl_result: dict[tech_id, TrlVerdict]
-```
+TRL도 다른 세 관점과 같은 `PerspectiveResult`를 반환한다.
+공통 필드와 계산 기준은 [EVALUATION_RESULT_SCHEMA.md](EVALUATION_RESULT_SCHEMA.md)를 따른다.
 
-| 키 | 타입 | 내용 |
-| --- | --- | --- |
-| `trl_range` | `[int, int]` \| `"NOT_VERIFIED"` | **하한 = 핵심 구성요소 최저 단계, 상한 = 전체 최고 단계** |
-| `range_derivation` | `str` | 구간 산출 규칙 설명 |
-| `components` | `list[dict]` | `{component, trl, is_critical, evidence}` |
-| `rationale` | `str` | 판정 요약 |
-| `evidence_scope` | `str` | `"paper_only"` — **논문 근거만으로 판정** |
-| `published` | `str` | 문헌 발표 시점 (`YYYY-MM`) |
-| `as_of` | `str` | 평가 기준일 |
-| `elapsed_months` | `int` | 발표 후 경과 개월 |
-| `interpretation_caveat` | `str` | 해석 주의 (아래) |
-| `rubric_source` | `str` | `3-1_technology_readiness.json` |
-| `estimation_basis` | `str` | `"공개 정보 기반 추정"` |
+- `score`: `[하한, 상한]` 또는 근거 부족 시 `null`. `score_scale`: `"1-9"`.
+- `criteria`: 구성요소별 단계·판정 이유·출처를 공통 항목으로 기록한다.
+- `criteria[].metadata.is_critical`: 해당 구성요소가 핵심 경로인지 표시한다.
+- `metadata`: 문헌 발표일, 기준일, 경과 개월, `paper_only`, 구간 산출 규칙을 기록한다.
+- `evidence.reference_id`: 기술 조사에서 확인한 출처 ID를 재사용한다.
 
-### ⚠️ TRL 해석 시 반드시 지킬 것
+하한은 출처를 확인한 핵심 구성요소의 최저 단계, 상한은 출처를 확인한 전체 구성요소의 최고 단계다.
+핵심 구성요소의 출처를 확인하지 못하면 구간을 보류한다.
 
-**TRL 값만 나란히 놓고 비교하지 마세요.** `elapsed_months`를 함께 읽어야 합니다.
-
-```
-                문헌 발표    경과      논문 근거 TRL
-DeepSeek-V2      2024-06     27개월     [?, ?]
-ITME             2026-06      3개월     [?, ?]
-```
-
-두 값이 같아도 **같은 의미가 아닙니다.** 논문 근거 TRL은 *"논문이라는 매체가 보여줄 수 있는
-성숙도의 상한"*이며, 발표 후 경과 기간이 9배 차이납니다.
-
-**실제 채택 근거는 TRL이 아니라 시장성 관점(`market_result`)에서 다룹니다.**
-TRL에 채택 근거를 끌어오면 같은 근거를 두 관점에서 이중 계상하게 되고,
-발표 시점이 최근인 기술이 구조적으로 불리해집니다.
-
-→ **성숙도 관점과 시장성 관점의 불일치 자체가 시사점**입니다.
-   "논문이 보여주는 것"과 "시장이 보여주는 것"이 다르다는 관찰로 종합 단계에서 다루시면 됩니다.
+TRL 비교 시 발표 시점과 경과 개월을 함께 읽어야 한다. TRL은 공개 논문 근거 기반 추정이며,
+실제 채택 근거는 시장성 관점에서 별도로 다룬다. 기술 주장은 TRL 판정 입력에서 제외하고,
+측정치·범위·한계를 원래 출처와 함께 전달한다.
