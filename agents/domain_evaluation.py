@@ -8,7 +8,6 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from agents.state import EvaluationState
 from agents.technical_research import TECH_REGISTRY
 from rag.embeddings import BGEM3Embeddings
 from rag.retriever import TechRetriever, format_chunks
@@ -106,7 +105,7 @@ def _is_noise_document(doc: Document) -> bool:
     )
 
 
-def domain_evaluation_agent(state: EvaluationState) -> dict:
+def domain_evaluation_agent(state: dict) -> dict:
     """논문 근거를 대조해 도메인 항목을 채점하고 가중 점수와 판정을 반환한다."""
 
     rubric = json.loads(RUBRIC_PATH.read_text(encoding="utf-8"))
@@ -136,6 +135,7 @@ def domain_evaluation_agent(state: EvaluationState) -> dict:
                 SystemMessage(prompt),
                 HumanMessage(
                     f"평가 도메인: {state.get('target_domain') or rubric['target_domain']}\n"
+                    f"배정된 작업: {state.get('instruction', '')}\n"
                     f"기술 조사: {json.dumps(profile, ensure_ascii=False)}\n"
                     f"루브릭: {json.dumps(rubric, ensure_ascii=False)}\n"
                     f"원문 근거:\n{format_chunks(sorted(docs.values(), key=lambda d: (d.metadata['page'], d.metadata['chunk_id'])))}"

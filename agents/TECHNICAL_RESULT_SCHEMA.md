@@ -78,7 +78,7 @@ ITME를 예로 들면, Abstract의 `1.80×`는 **NVMe-oF 대비**이고 §6.1의
 
 ## 2. `trl_result` — TRL 평가 Node 출력
 
-TRL도 다른 세 관점과 같은 `PerspectiveResult`를 반환한다.
+TRL도 다른 세 관점과 같은 공통 평가 결과 형식의 `dict`를 반환한다.
 공통 필드와 계산 기준은 [EVALUATION_RESULT_SCHEMA.md](EVALUATION_RESULT_SCHEMA.md)를 따른다.
 
 - `score`: `[하한, 상한]` 또는 근거 부족 시 `null`. `score_scale`: `"1-9"`.

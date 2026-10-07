@@ -8,7 +8,6 @@ from langchain_tavily import TavilySearch
 from pydantic import BaseModel, Field
 
 from agents.resilient import error_record
-from agents.state import EvaluationState
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATH = ROOT / "prompts" / "stakeholder_evaluation.md"
@@ -44,7 +43,7 @@ class TechnologyAssessment(BaseModel):
     )
 
 
-def stakeholder_evaluation_agent(state: EvaluationState) -> dict:
+def stakeholder_evaluation_agent(state: dict) -> dict:
     """웹 검색 근거로 채택·투자 등 이해관계자 항목을 평가한다."""
 
     rubric = json.loads(RUBRIC_PATH.read_text(encoding="utf-8"))
@@ -90,6 +89,7 @@ def stakeholder_evaluation_agent(state: EvaluationState) -> dict:
                     json.dumps(
                         {
                             "technology": profile["title"],
+                            "instruction": state.get("instruction", ""),
                             "target_domain": state.get("target_domain", ""),
                             "technical_context": profile,
                             "rubric": rubric,

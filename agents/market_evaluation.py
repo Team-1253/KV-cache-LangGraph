@@ -8,7 +8,6 @@ from langchain_tavily import TavilySearch
 from pydantic import BaseModel, Field
 
 from agents.resilient import error_record
-from agents.state import EvaluationState
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATH = ROOT / "prompts" / "market_evaluation.md"
@@ -67,7 +66,7 @@ def build_queries(criterion: dict, profile: dict, attempt: int) -> list[str]:
 
 
 def market_evaluation_agent(
-    state: EvaluationState, criteria: list[dict] | None = None
+    state: dict, criteria: list[dict] | None = None
 ) -> dict:
     """항목별 웹 근거의 신뢰도를 판단한 뒤 시장성 점수와 출처를 반환한다."""
 
@@ -125,6 +124,7 @@ def market_evaluation_agent(
                 request = json.dumps(
                     {
                         "technology": profile["title"],
+                        "instruction": state.get("instruction", ""),
                         "technical_context": profile,
                         "criterion": criterion,
                         "results": results,

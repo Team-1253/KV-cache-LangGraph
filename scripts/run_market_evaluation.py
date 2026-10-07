@@ -20,7 +20,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -32,14 +32,13 @@ from unittest.mock import patch
 from contextlib import ExitStack
 from types import SimpleNamespace
 from agents import market_evaluation as market  # noqa: E402
-from agents.state import EvaluationState  # noqa: E402
 
 
 def _source(chunk_id: str, page: int) -> dict:
     return {"chunk_id": chunk_id, "page": page, "reference_id": f"technical-{chunk_id}"}
 
 
-def sample_state() -> EvaluationState:
+def sample_state() -> dict:
     """`TECHNICAL_RESULT_SCHEMA.md`를 따르는 최소 fixture."""
     payload: dict[str, Any] = {
         "selected_technologies": {"sw": "DeepSeek-V2 MLA", "hw": "ITME"},
@@ -107,7 +106,7 @@ def sample_state() -> EvaluationState:
             },
         },
     }
-    return cast(EvaluationState, payload)
+    return payload
 
 
 class FakeSearch:
@@ -142,7 +141,7 @@ def main() -> int:
     load_dotenv(ROOT / ".env", override=True)
     args = parse_args()
 
-    state: EvaluationState = (
+    state: dict = (
         json.loads(args.input.read_text(encoding="utf-8")) if args.input else sample_state()
     )
 

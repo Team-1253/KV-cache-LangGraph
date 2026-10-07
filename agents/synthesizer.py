@@ -1,3 +1,5 @@
+"""Worker 결과를 한 번의 모델 호출로 분석하고 최종 보고서를 저장한다."""
+
 import json
 import re
 from pathlib import Path
@@ -6,11 +8,12 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from agents.state import EvaluationState, evaluation_material
+from agents.resilient import error_record, fallback_report
+from agents.state import OrchestratorState
 
-PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent / "prompts" / "report_generation.md"
-)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+PROMPT_PATH = ROOT_DIR / "prompts" / "synthesizer.md"
+OUTPUT_DIR = ROOT_DIR / "outputs"
 LABELS = {
     "trl": "기술 성숙도",
     "market": "시장성",
@@ -63,12 +66,50 @@ class ReportNarrative(BaseModel):
     )
 
 
-def report_generation_agent(state: EvaluationState) -> dict:
-    """모델이 작성한 해석에 평가 원자료와 각주를 결합해 보고서를 만든다."""
+def evaluation_material(state: OrchestratorState) -> dict:
+    """기술 조사와 관점별 평가를 실제 사용된 출처와 함께 취합한다."""
+
+    outputs = [result["output"] for result in state["results"]]
+    technical_result = outputs[0].get("technical_result", {})
+    evaluations = [
+        result
+        for output in outputs
+        for key in ("trl_result", "market_result", "stakeholder_result", "domain_result")
+        for result in output.get(key, {}).values()
+    ]
+    used_ids = {
+        evidence["reference_id"]
+        for result in evaluations
+        for criterion in result["criteria"]
+        for evidence in criterion["evidence"]
+    }
+    for profile in technical_result.values():
+        for field in (
+            "mechanism", "scope", "claims", "measurements",
+            "limits_explicit", "limits_implicit"
+        ):
+            used_ids.update(item["source"]["reference_id"] for item in profile[field])
+
+    references = {
+        ref["id"]: ref
+        for output in outputs
+        for ref in output.get("references", [])
+        if ref["id"] in used_ids
+    }
+    return {
+        "target_domain": state.get("target_domain", ""),
+        "background_facts": state.get("background_facts", {}),
+        "technical_result": technical_result,
+        "evaluations": evaluations,
+        "references": list(references.values()),
+        "run_errors": state.get("errors", []),
+    }
+
+
+def synthesizer(state: OrchestratorState) -> dict:
+    """교재처럼 results를 읽어 종합·보고서 생성을 한 노드에서 수행한다."""
 
     material = evaluation_material(state)
-    material["evaluation_result"] = state.get("evaluation_result", {})
-    # 공유 State를 변경하지 않고 보고서 작성에만 사용할 항목 키를 붙인다.
     material["evaluations"] = [
         {**result, "criteria": [
             {**criterion, "report_key": f"evaluation_{i}_criterion_{j}"}
@@ -76,35 +117,40 @@ def report_generation_agent(state: EvaluationState) -> dict:
         ]}
         for i, result in enumerate(material["evaluations"])
     ]
-    references = {ref["id"]: ref for ref in material["references"]}
-
-    model = init_chat_model(
-        "gpt-5.6-luna",
-        model_provider="openai",
-        reasoning_effort="low",
-        use_responses_api=True,
-        temperature=0,
-        timeout=90,
-        max_retries=2,
-    )
-
-    narrative = model.with_structured_output(ReportNarrative).invoke(
-        [
-            SystemMessage(
-                PROMPT_PATH.read_text(encoding="utf-8")
-                + "\n\n보고서 압축 규칙: 기존 장 구성은 유지한다. 각 서술 영역은 "
-                "2~3문장, 요약은 3문장 이내로 작성한다. 관점별 항목은 핵심 근거와 "
-                "한계만 남기고 점수를 다시 선언하거나 루브릭을 풀어 쓰지 않는다. "
-                "같은 성능 수치는 측정값 표에 모으며 평가 이유에 꼭 필요한 경우만 "
-                "본문에서 반복한다. 미확인 항목은 대상과 사유를 한 문장으로 쓴다. "
-                "점수, 근거 확보율, 판정 보류, 수치의 비교 조건은 보존한다. "
-                "REFERENCE에는 인용한 문헌의 서지 정보만 코드가 배치하며 "
-                "긴 원문 발췌나 평가 서술은 넣지 않는다."
-            ),
+    errors = []
+    status = "PARTIAL" if state.get("errors") else "SUCCESS"
+    try:
+        if state.get("quality"):
+            material["previous_report"] = Path(state["report_uri"]).read_text(encoding="utf-8")
+            material["quality_feedback"] = state["quality"]
+        model = init_chat_model(
+            "gpt-5.6-luna", model_provider="openai", reasoning_effort="low",
+            use_responses_api=True, temperature=0, timeout=90, max_retries=2,
+        )
+        narrative = model.with_structured_output(ReportNarrative).invoke([
+            SystemMessage(PROMPT_PATH.read_text(encoding="utf-8")),
             HumanMessage(json.dumps(material, ensure_ascii=False)),
-        ]
-    )
+        ])
+        report = render_report(narrative, material)
+    except Exception as exc:
+        errors = [error_record("synthesizer", exc)]
+        material["run_errors"] = [*material["run_errors"], *errors]
+        report = fallback_report(material, "보고서 종합 단계가 실패했다.")
+        status = "FAILED"
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / f"{state['run_id']}.md"
+    path.write_text(report, encoding="utf-8")
+    return {
+        "report_uri": str(path), "status": status, "errors": errors,
+        "step_count": state.get("step_count", 0) + 1,
+    }
+
+
+def render_report(narrative: ReportNarrative, material: dict) -> str:
+    """기존 보고서 형식과 점수·측정값·출처를 보존한다."""
+
+    references = {ref["id"]: ref for ref in material["references"]}
     rationales = {item.key: item.text.strip() for item in narrative.criterion_rationales}
     citation_numbers = {}
     bibliography_refs = {}
@@ -212,14 +258,14 @@ def report_generation_agent(state: EvaluationState) -> dict:
 
     report = "# 기술 다관점 평가 보고서\n\n" + "\n\n".join(sections) + "\n"
 
-    if state.get("run_errors"):
+    if material.get("run_errors"):
         report += (
             "\n### 실행 중 확인한 오류\n\n"
             + "\n".join(
                 f"- {error['stage']}: {error['error_type']}"
-                for error in state["run_errors"]
+                for error in material["run_errors"]
             )
             + "\n"
         )
 
-    return {"final_report": report}
+    return report

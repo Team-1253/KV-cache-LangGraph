@@ -82,7 +82,7 @@
 
 - **Framework** : LangGraph (StateGraph, Dynamic Fan-out / Fan-in)
 - **LLM/Generator** : gpt-4.1-mini (기술 조사·TRL·도메인) / gpt-5.6-luna (시장·이해관계자·보고서)
-- **LLM/Judge** : gpt-4.1-nano (평가 종합) <!-- TODO: 품질 평가 노드 모델 확정 -->
+- **LLM/Planner** : gpt-4.1-nano (Orchestrator)
 - **Retrieval** : FAISS — **Hit Rate@5 0.88, MRR 0.721** (골든 QA 25문항 기준)
 - **Embedding** : **BAAI/bge-m3** (오픈소스)
 - **PDF Loader** : PyPDFLoader
@@ -116,6 +116,25 @@
 | ⚖️ Synthesizer | Worker 결과를 **취합**하고 관점 간 일치·불일치·trade-off 도출 | X | Fan-in |
 | 📝 보고서 생성 | 다관점 평가 보고서 작성 | X | |
 | ✅ 품질 평가 | Groundedness·중립성·편향통제·관점커버리지 검사. 미달 시 재계획 | X | 게이트 |
+
+`agents/state.py`에는 `OrchestratorState`와 `WorkerState` 두 스키마만 정의한다.
+부모는 입력·계획·누적 결과·오류·보고서 위치를 관리한다.
+`WorkerState`는 배정된 `task`와 입력 dict(`task_input`)만 갖고, 결과는 부모의 `results`로 반환한다.
+별도 Worker 그래프나 중간 결과 파일은 만들지 않는다.
+Orchestrator는 실제 기술 조사 결과와 평가 목표를 읽고, LLM의 구조화된 `Plan`으로 작업을 계획한다.
+각 작업은 `worker`, `tech_ids`, `instruction`, `reason`을 가지며 실행 전에 `task_id`를 붙인다.
+기술별 근거와 평가 목표에 따라 작업을 나누거나 묶으므로 작업 수는 고정하지 않는다.
+`Send`는 배정된 기술의 조사 결과·출처와 작업 지시만 Worker에 전달한다.
+종합 단계는 누적된 결과를 읽는다.
+`Plan`은 계획 응답 형식이며, State는 두 개만 사용한다.
+`langgraph-v1/12-Pattern/04-Orchestrator-Workers.ipynb`의 계획 → `Send` → Worker → Synthesizer 연결을 사용한다.
+Synthesizer는 `results`를 읽고 `with_structured_output`으로 종합 분석과 보고서 서술을 한 번에 받는다.
+`agents/synthesizer.py`의 함수를 그래프에 직접 등록하며, 점수·측정값·각주 조립은 기존 코드를 사용한다.
+품질 검증은 `report_uri`의 보고서와 `results`의 원자료를 대조하고 `quality`에 네 항목과 피드백을 기록한다.
+미달 시 Synthesizer에 이전 보고서와 피드백을 전달해 수정한다. 조사·평가 Worker는 다시 실행하지 않는다.
+`step_count`는 보고서 생성 횟수이며 `max_steps`의 기본값은 2다(초안 + 수정 1회).
+수정 후에도 품질 미달이면 `PARTIAL`, 생성·품질 검사 실패 시 `FAILED`로 종료한다.
+원문과 대량 결과의 외부 저장·체크포인트 크기 제한도 아직 연결하지 않았다.
 
 ### 설계 원칙
 

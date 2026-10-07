@@ -1,8 +1,9 @@
 # 관점별 결과와 출처 계약
 
 `trl_result`, `market_result`, `stakeholder_result`, `domain_result`는 모두
-`dict[tech_id, PerspectiveResult]`다. 타입 선언은 `agents/state.py`에 있다.
-각 노드는 자기 결과와 `references`만 추가하며, 실행 오류는 `run_errors`에 남긴다.
+`tech_id`를 키로 한 dict다. 아래 계약은 Worker가 반환하는 데이터 형식이다.
+각 평가 함수는 자기 결과와 `references`를 반환하며, 실행 오류는 `run_errors`에 남긴다.
+부모 State의 `results[].output`에 이 결과 dict를 누적한다.
 
 ## 공통 평가 결과
 
@@ -52,14 +53,14 @@ TRL은 기술 조사에서 이미 확인한 출처 ID를 재사용한다.
 
 ## 취합과 보고서
 
-`evaluation_material()`은 네 관점을 같은 평가 목록으로 모으고, 평가와 기술 조사에서
-실제로 연결된 출처만 전달한다. `evaluation_result`는 기존 종합 프롬프트에 따라 JSON 또는
-자유 서술을 보존한다.
+`agents/synthesizer.py`의 `evaluation_material()`은 부모의 `results`를 읽어
+네 관점을 같은 평가 목록으로 모으고, 평가와 기술 조사에서 실제로 연결된 출처만 전달한다.
 
-보고서는 모델에 한 번 요청해 요약·배경·선정·기술 개요·시사점·한계를 작성한다.
+Synthesizer는 모델에 한 번 요청해 관점 간 종합 판단과 요약·배경·선정·기술 개요·시사점·한계를 작성한다.
 관점별 점수·coverage·판정·항목 근거와 측정값의 baseline·조건은 Python이 원자료 그대로 싣는다.
 문단과 항목에 실제 출처 ID의 각주를 붙이고, **본문에서 사용한 출처만** REFERENCE에 싣는다.
 
 노드 실패는 공통 실행 경계에서 기록하며 다음 단계로 진행한다.
-보고서 모델 호출 전체가 실패하면 확보한 원자료와 오류를 담은 대체 보고서를 반환한다.
+보고서 모델 호출 전체가 실패하면 확보한 원자료와 오류를 담은 대체 보고서를 저장한다.
+Synthesizer는 보고서 파일 경로를 `report_uri`로 반환한다.
 이전처럼 장마다 모델을 따로 호출하거나 개별 장을 재시도하지 않는다.
