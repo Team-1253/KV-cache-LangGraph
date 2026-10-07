@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""논문 RAG 기반 기술 조사와 공개 근거 기반 TRL 추정."""
 from __future__ import annotations
 
 import json
@@ -16,18 +15,18 @@ from agents.state import EvaluationState
 from rag.retriever import TechRetriever, format_chunks
 
 MODEL_NAME = "gpt-4.1-mini"
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "technical_research.md"
+PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent / "prompts" / "technical_research.md"
+)
 NOT_VERIFIED = "NOT_VERIFIED"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRL_RUBRIC_PATH = DATA_DIR / "3-1_technology_readiness.json"
 
-# 평가 기준일. 문헌 발표 후 경과 기간을 재는 고정 시점이다.
+# 실행 날짜에 따라 TRL 해석의 시간 맥락이 달라지지 않도록 기준일을 고정한다.
 AS_OF = date(2026, 9, 22)
 
-# ── 기술 레지스트리 ──────────────────────────────────────────
-# state["selected_technologies"]는 `dict[str, str]` 계약이라 PDF 경로를 담지 못한다.
-# 공용 State를 건드리지 않기 위해 원문 경로·인용 정보는 이 모듈이 보유한다.
+# State에는 기술 선택만 담고, 논문 경로와 인용 정보는 기술·도메인 평가가 공유한다.
 TECH_REGISTRY: dict[str, dict[str, str]] = {
     "deepseek_v2_mla": {
         "camp": "SW",
@@ -53,7 +52,7 @@ TECH_REGISTRY: dict[str, dict[str, str]] = {
     },
 }
 
-# 관점별 고정 질의. 질의 언어는 한국어(팀 확정 정책).
+# 기술마다 같은 관점을 조사하도록 한국어 고정 질의를 사용한다.
 ASPECT_QUERIES: list[str] = [
     "이 기술의 핵심 접근 방식은 무엇인가",
     "어떤 문제를 해결하려고 하는가",
@@ -70,35 +69,47 @@ ASPECT_QUERIES: list[str] = [
 
 
 def _elapsed_months(published: str, as_of: date = AS_OF) -> int:
-    """문헌 발표 후 기준일까지 경과 개월. TRL 해석 시 반드시 함께 읽어야 한다."""
+    """문헌 발표 월부터 평가 기준 월까지의 경과 개월을 계산한다."""
+
     y, m = (int(x) for x in published.split("-")[:2])
     return (as_of.year - y) * 12 + (as_of.month - m)
 
 
 def _prompt_sections() -> dict[str, str]:
-    """`prompts/technical_research.md`의 `## [SECTION]` 블록을 파싱한다."""
+    """프롬프트 파일의 섹션 경계는 `## [SECTION]` 형식을 따라야 한다."""
+
     text = PROMPT_PATH.read_text(encoding="utf-8")
     parts = re.split(r"^## \[([A-Z_]+)\]\s*$", text, flags=re.MULTILINE)
     return {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
 
 
 class _Source(BaseModel):
+    """기술 조사에서 인용한 PDF 청크 ID와 페이지."""
+
     chunk_id: str = Field(description="근거 청크의 id. 제공된 <chunk id=...> 값 그대로")
     page: int = Field(description="근거 청크의 page 값")
 
 
 class _Evidenced(BaseModel):
+    """원문 출처가 연결된 기술 설명."""
+
     text: str
     source: _Source
 
 
 class _Claim(BaseModel):
+    """논문이 주장한 효과와 비교 대상, 출처."""
+
     text: str = Field(description="논문이 주장하는 효과")
-    baseline: str = Field(description="무엇 대비인가. 원문에 없으면 항목을 출력하지 말 것")
+    baseline: str = Field(
+        description="무엇 대비인가. 원문에 없으면 항목을 출력하지 말 것"
+    )
     source: _Source
 
 
 class _Measurement(BaseModel):
+    """논문의 측정 지표·값·비교 대상·실험 조건과 출처."""
+
     metric: str = Field(description="지표명 (예: TTFT speedup, KV cache reduction)")
     value: str = Field(description="측정값 (단위 포함)")
     baseline: str = Field(description="비교 기준. 필수")
@@ -107,12 +118,16 @@ class _Measurement(BaseModel):
 
 
 class _Limit(BaseModel):
+    """기술의 한계와 그 판단 근거, 출처."""
+
     text: str
     basis: str = Field(description="명시적 한계면 원문 근거, 암묵적 한계면 역산 근거")
     source: _Source
 
 
 class _Extraction(BaseModel):
+    """논문에서 추출한 개요, 작동 방식, 적용 범위, 주장·측정값과 명시적 한계."""
+
     overview: str
     mechanism: list[_Evidenced] = Field(default_factory=list)
     scope: list[_Evidenced] = Field(default_factory=list)
@@ -122,24 +137,33 @@ class _Extraction(BaseModel):
 
 
 class _ImplicitLimits(BaseModel):
+    """논문 근거에서 추론한 암묵적 한계 목록."""
+
     limits_implicit: list[_Limit] = Field(default_factory=list)
 
 
 class TrlComponent(BaseModel):
+    """구성요소 하나의 TRL 추정과 핵심 여부, 근거 출처."""
+
     component: str
     trl: int = Field(ge=1, le=9)
     evidence: str
     is_critical: bool
-    reference_ids: list[str] = Field(description="근거로 사용한 입력 source.reference_id 목록")
+    reference_ids: list[str] = Field(
+        description="근거로 사용한 입력 source.reference_id 목록"
+    )
 
 
 class TrlAssessment(BaseModel):
+    """기술 구성요소별 TRL 추정과 전체 판단 이유."""
+
     components: list[TrlComponent]
     rationale: str
 
 
 def _resolve_techs(selected: dict | None) -> list[str]:
-    """선택된 기술 이름을 레지스트리 id로 해석한다."""
+    """선택 이름과 SW·HW 구분을 등록된 기술 ID에 대응시킨다."""
+
     if not selected:
         return list(TECH_REGISTRY)
 
@@ -147,64 +171,124 @@ def _resolve_techs(selected: dict | None) -> list[str]:
     matches = []
     for tech_id, meta in TECH_REGISTRY.items():
         keywords = ("deepseek", "mla") if tech_id == "deepseek_v2_mla" else ("itme",)
-        if tech_id in selections or meta["camp"].lower() in selections or any(
-            keyword in token for keyword in keywords for token in selections
+        if (
+            tech_id in selections
+            or meta["camp"].lower() in selections
+            or any(keyword in token for keyword in keywords for token in selections)
         ):
             matches.append(tech_id)
+
     return matches or list(TECH_REGISTRY)
 
 
-# 목차(dot leader)·참고문헌 목록은 근거 가치가 없으므로 검색 결과에서 제외한다.
-# ※ 인덱스 자체는 건드리지 않는다(벤치마크 측정값과 동일한 인덱스를 유지하기 위함).
+# 공용 인덱스는 유지하면서, 근거 추출 문맥에 섞인 목차·참고문헌 잡음만 제외한다.
 _DOT_LEADER = re.compile(r"(?:\.\s*){4,}")
 _BIB_LINE = re.compile(r"^\s*\[\d+\]\s")
 
 
 def _is_noise(doc: Document) -> bool:
+    """목차나 참고문헌 목록이 주를 이루는 청크를 판별한다."""
+
     lines = [l for l in doc.page_content.split("\n") if l.strip()]
     if not lines:
         return True
+
     toc = sum(bool(_DOT_LEADER.search(l)) for l in lines)
     bib = sum(bool(_BIB_LINE.match(l)) for l in lines)
     return toc / len(lines) >= 0.3 or bib / len(lines) >= 0.5
 
 
 def _retrieve(retriever: TechRetriever, per_query_k: int = 4) -> list[Document]:
-    """관점별 고정 질의를 모두 던지고 chunk_id 기준으로 중복 제거한다."""
+    """관점별 검색 결과에서 잡음과 중복을 제거하고 원문 순서로 정렬한다."""
+
     seen: dict[str, Document] = {}
     for q in ASPECT_QUERIES:
         for d in retriever.search(q, k=per_query_k):
             if _is_noise(d):
                 continue
             seen.setdefault(d.metadata["chunk_id"], d)
-    return sorted(seen.values(), key=lambda d: (d.metadata["page"], d.metadata["chunk_id"]))
+
+    return sorted(
+        seen.values(), key=lambda d: (d.metadata["page"], d.metadata["chunk_id"])
+    )
 
 
-_PLACEHOLDER = {"", "-", "--", "n/a", "na", "none", "없음", "미상", "불명", "not specified", "unknown"}
-FACT_FIELDS = ("mechanism", "scope", "claims", "measurements", "limits_explicit", "limits_implicit")
+_PLACEHOLDER = {
+    "",
+    "-",
+    "--",
+    "n/a",
+    "na",
+    "none",
+    "없음",
+    "미상",
+    "불명",
+    "not specified",
+    "unknown",
+}
+FACT_FIELDS = (
+    "mechanism",
+    "scope",
+    "claims",
+    "measurements",
+    "limits_explicit",
+    "limits_implicit",
+)
 
 
 def technical_research_agent(state: EvaluationState) -> dict:
+    """논문에서 기술 사실과 한계를 추출해 검색 청크의 출처를 연결한다."""
+
     prompts = _prompt_sections()
-    model = init_chat_model(MODEL_NAME, model_provider="openai", temperature=0, max_retries=2)
+    model = init_chat_model(
+        MODEL_NAME, model_provider="openai", temperature=0, max_retries=2
+    )
+
     from rag.embeddings import BGEM3Embeddings
+
     embeddings = BGEM3Embeddings()
+
     results, references = {}, {}
+
     for tech_id in _resolve_techs(state.get("selected_technologies")):
+
         meta = TECH_REGISTRY[tech_id]
-        docs = _retrieve(TechRetriever(tech_id, meta["pdf"], embeddings=embeddings).build())
+        docs = _retrieve(
+            TechRetriever(tech_id, meta["pdf"], embeddings=embeddings).build()
+        )
         doc_by_id = {doc.metadata["chunk_id"]: doc for doc in docs}
         context = format_chunks(docs)
-        extracted = model.with_structured_output(_Extraction).invoke([
-            SystemMessage(prompts["SYSTEM"]),
-            HumanMessage(prompts["EXTRACT"].format(tech_name=meta["name"], context=context)),
-        ]).model_dump()
-        implicit = model.with_structured_output(_ImplicitLimits).invoke([
-            SystemMessage(prompts["SYSTEM"]),
-            HumanMessage(prompts["IMPLICIT_LIMITS"].format(tech_name=meta["name"], context=context)),
-        ])
-        extracted["limits_implicit"] = [item.model_dump() for item in implicit.limits_implicit]
+
+        extracted = (
+            model.with_structured_output(_Extraction)
+            .invoke(
+                [
+                    SystemMessage(prompts["SYSTEM"]),
+                    HumanMessage(
+                        prompts["EXTRACT"].format(
+                            tech_name=meta["name"], context=context
+                        )
+                    ),
+                ]
+            )
+            .model_dump()
+        )
+
+        implicit = model.with_structured_output(_ImplicitLimits).invoke(
+            [
+                SystemMessage(prompts["SYSTEM"]),
+                HumanMessage(
+                    prompts["IMPLICIT_LIMITS"].format(
+                        tech_name=meta["name"], context=context
+                    )
+                ),
+            ]
+        )
+        extracted["limits_implicit"] = [
+            item.model_dump() for item in implicit.limits_implicit
+        ]
         extracted["overview"] = extracted["overview"] or NOT_VERIFIED
+
         dropped = {}
         for field in FACT_FIELDS:
             kept = []
@@ -212,48 +296,95 @@ def technical_research_agent(state: EvaluationState) -> dict:
                 doc = doc_by_id.get(item["source"]["chunk_id"])
                 if doc is None:
                     continue
-                if field == "measurements" and any(item[key].strip().lower() in _PLACEHOLDER for key in ("baseline", "condition")):
+
+                # 비교 대상과 실험 조건이 없는 수치는 기술 간 비교 근거로 쓰지 않는다.
+                if field == "measurements" and any(
+                    item[key].strip().lower() in _PLACEHOLDER
+                    for key in ("baseline", "condition")
+                ):
                     continue
+
                 ref_id = f"technical-{doc.metadata['chunk_id']}"
                 item["source"].update(reference_id=ref_id, page=doc.metadata["page"])
                 references[ref_id] = {
-                    "id": ref_id, "tech_id": tech_id, "perspective": "technical",
-                    "title": meta["citation"], "url": meta["url"], "date": meta["published"],
-                    "page": doc.metadata["page"], "content": doc.page_content,
+                    "id": ref_id,
+                    "tech_id": tech_id,
+                    "perspective": "technical",
+                    "title": meta["citation"],
+                    "url": meta["url"],
+                    "date": meta["published"],
+                    "page": doc.metadata["page"],
+                    "content": doc.page_content,
                     "metadata": {"kind": "paper", "chunk_id": doc.metadata["chunk_id"]},
                 }
                 kept.append(item)
+
             dropped[field] = len(extracted[field]) - len(kept)
             extracted[field] = kept
+
         counts = {field: len(extracted[field]) for field in FACT_FIELDS}
-        level = "strong" if counts["measurements"] >= 3 and counts["limits_explicit"] else "limited"
+        level = (
+            "strong"
+            if counts["measurements"] >= 3 and counts["limits_explicit"]
+            else "limited"
+        )
         results[tech_id] = {
-            "tech_id": tech_id, "camp": meta["camp"], "title": meta["name"],
-            **extracted, "evidence_level": level if sum(counts.values()) else NOT_VERIFIED,
-            "retrieval": {"chunks_used": len(docs), "pages": sorted({d.metadata["page"] for d in docs}),
-                          "counts": counts, "dropped_ungrounded": dropped},
+            "tech_id": tech_id,
+            "camp": meta["camp"],
+            "title": meta["name"],
+            **extracted,
+            "evidence_level": level if sum(counts.values()) else NOT_VERIFIED,
+            "retrieval": {
+                "chunks_used": len(docs),
+                "pages": sorted({d.metadata["page"] for d in docs}),
+                "counts": counts,
+                "dropped_ungrounded": dropped,
+            },
         }
         print(f"[technical] {tech_id}: {len(docs)} 청크, 추출 {counts}")
+
     return {"technical_result": results, "references": list(references.values())}
 
 
 def trl_evaluation_node(state: EvaluationState) -> dict:
+    """기술 조사 근거로 구성요소별 TRL을 추정하고 성숙도 구간을 반환한다."""
+
     prompts = _prompt_sections()
     rubric = TRL_RUBRIC_PATH.read_text(encoding="utf-8")
-    model = init_chat_model(MODEL_NAME, model_provider="openai", temperature=0, max_retries=2)
+    model = init_chat_model(
+        MODEL_NAME, model_provider="openai", temperature=0, max_retries=2
+    )
+
     references = {ref["id"]: ref for ref in state.get("references", [])}
     evaluations = {}
+
     for tech_id, profile in state.get("technical_result", {}).items():
-        # 주장은 TRL 근거에서 제외하고, 측정·조건·한계를 출처와 함께 전달한다.
-        facts = {field: profile[field] for field in ("scope", "measurements", "limits_explicit", "limits_implicit")}
+        # 제안자의 효과 주장만으로 성숙도를 높게 추정하지 않도록 claims를 근거에서 제외한다.
+        facts = {
+            field: profile[field]
+            for field in ("scope", "measurements", "limits_explicit", "limits_implicit")
+        }
         facts["overview"] = profile["overview"]
-        assessment = model.with_structured_output(TrlAssessment).invoke([
-            SystemMessage(prompts["TRL_SYSTEM"]),
-            HumanMessage(prompts["TRL_USER"].format(
-                tech_name=profile["title"], profile=json.dumps(facts, ensure_ascii=False), rubric=rubric,
-            )),
-        ])
-        allowed_ids = {item["source"]["reference_id"] for field in facts if field != "overview" for item in facts[field]}
+
+        assessment = model.with_structured_output(TrlAssessment).invoke(
+            [
+                SystemMessage(prompts["TRL_SYSTEM"]),
+                HumanMessage(
+                    prompts["TRL_USER"].format(
+                        tech_name=profile["title"],
+                        profile=json.dumps(facts, ensure_ascii=False),
+                        rubric=rubric,
+                    )
+                ),
+            ]
+        )
+
+        allowed_ids = {
+            item["source"]["reference_id"]
+            for field in facts
+            if field != "overview"
+            for item in facts[field]
+        }
         criteria, verified_components = [], []
         for index, component in enumerate(assessment.components, 1):
             evidence = [
@@ -263,26 +394,59 @@ def trl_evaluation_node(state: EvaluationState) -> dict:
             ]
             if evidence:
                 verified_components.append(component)
-            criteria.append({
-                "id": f"TRL-{index}", "name": component.component,
-                "status": "VERIFIED" if evidence else "NOT_VERIFIED",
-                "score": component.trl if evidence else None,
-                "rationale": component.evidence, "evidence": evidence,
-                "metadata": {"is_critical": component.is_critical},
-            })
+            criteria.append(
+                {
+                    "id": f"TRL-{index}",
+                    "name": component.component,
+                    "status": "VERIFIED" if evidence else "NOT_VERIFIED",
+                    "score": component.trl if evidence else None,
+                    "rationale": component.evidence,
+                    "evidence": evidence,
+                    "metadata": {"is_critical": component.is_critical},
+                }
+            )
+
         critical = [c.trl for c in verified_components if c.is_critical]
-        unknown_critical = any(c.is_critical and not item["evidence"] for c, item in zip(assessment.components, criteria))
-        score = [min(critical or [c.trl for c in verified_components]), max(c.trl for c in verified_components)] if verified_components and not unknown_critical else None
+        # 핵심 구성요소의 근거 공백은 다른 구성요소의 높은 TRL로 보완할 수 없다.
+        unknown_critical = any(
+            c.is_critical and not item["evidence"]
+            for c, item in zip(assessment.components, criteria)
+        )
+        score = (
+            [
+                min(critical or [c.trl for c in verified_components]),
+                max(c.trl for c in verified_components),
+            ]
+            if verified_components and not unknown_critical
+            else None
+        )
         coverage = len(verified_components) / len(criteria) if criteria else 0
+
         meta = TECH_REGISTRY[tech_id]
         evaluations[tech_id] = {
-            "tech_id": tech_id, "technology": profile["title"], "perspective": "trl",
-            "status": "VERIFIED" if coverage == 1 else "PARTIAL" if coverage else "NOT_VERIFIED",
-            "score": score, "score_scale": "1-9", "coverage": coverage,
-            "summary": assessment.rationale, "verdict": "공개 논문 근거 기반 추정" if score else "판정 보류 — 근거 불충분",
+            "tech_id": tech_id,
+            "technology": profile["title"],
+            "perspective": "trl",
+            "status": (
+                "VERIFIED"
+                if coverage == 1
+                else "PARTIAL" if coverage else "NOT_VERIFIED"
+            ),
+            "score": score,
+            "score_scale": "1-9",
+            "coverage": coverage,
+            "summary": assessment.rationale,
+            "verdict": (
+                "공개 논문 근거 기반 추정" if score else "판정 보류 — 근거 불충분"
+            ),
             "criteria": criteria,
-            "metadata": {"published": meta["published"], "as_of": AS_OF.isoformat(),
-                         "elapsed_months": _elapsed_months(meta["published"]), "evidence_scope": "paper_only",
-                         "range_derivation": "하한=핵심 구성요소 최저 단계, 상한=전체 구성요소 최고 단계"},
+            "metadata": {
+                "published": meta["published"],
+                "as_of": AS_OF.isoformat(),
+                "elapsed_months": _elapsed_months(meta["published"]),
+                "evidence_scope": "paper_only",
+                "range_derivation": "하한=핵심 구성요소 최저 단계, 상한=전체 구성요소 최고 단계",
+            },
         }
+
     return {"trl_result": evaluations, "references": []}
