@@ -68,6 +68,9 @@ def report_generation_agent(state: EvaluationState) -> dict:
 
     material = evaluation_material(state)
     material["evaluation_result"] = state.get("evaluation_result", {})
+    if state.get("report_quality"):
+        material["previous_report"] = state.get("final_report", "")
+        material["quality_feedback"] = state["report_quality"]
     # 공유 State를 변경하지 않고 보고서 작성에만 사용할 항목 키를 붙인다.
     material["evaluations"] = [
         {**result, "criteria": [

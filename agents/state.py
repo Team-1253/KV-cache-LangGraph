@@ -76,6 +76,8 @@ class EvaluationState(TypedDict, total=False):
     references: Annotated[list[Reference], operator.add]
 
     final_report: str
+    report_quality: dict[str, Any]
+    report_retry_count: int
 
 
 def evaluation_material(state: EvaluationState) -> dict:

@@ -8,6 +8,7 @@ from agents.evaluation_synthesis import evaluation_synthesis_agent
 from agents.market_evaluation import market_evaluation_agent
 from agents.resilient import continuing_node
 from agents.report_generation import report_generation_agent
+from agents.report_quality import report_quality_agent, route_report_quality
 from agents.state import EvaluationState
 from agents.stakeholder_evaluation import stakeholder_evaluation_agent
 from agents.technical_research import technical_research_agent, trl_evaluation_node
@@ -33,6 +34,7 @@ def build_graph():
         continuing_node(evaluation_synthesis_agent, "evaluation_result"),
     )
     builder.add_node("report_generation", continuing_node(report_generation_agent, "final_report"))
+    builder.add_node("report_quality", continuing_node(report_quality_agent, "report_quality"))
 
     builder.add_edge(START, "technical_research")
     builder.add_edge("technical_research", "trl_evaluation")
@@ -51,7 +53,11 @@ def build_graph():
     )
 
     builder.add_edge("evaluation_synthesis", "report_generation")
-    builder.add_edge("report_generation", END)
+    builder.add_edge("report_generation", "report_quality")
+    builder.add_conditional_edges(
+        "report_quality", route_report_quality,
+        {"retry": "report_generation", "end": END},
+    )
 
     return builder.compile()
 
@@ -67,6 +73,7 @@ if __name__ == "__main__":
         "references": [],
     })
     print(result["final_report"])
+    print("보고서 품질 평가:", result["report_quality"])
     output = Path(__file__).resolve().parent / "outputs" / "final_report.md"
     output.parent.mkdir(exist_ok=True)
     output.write_text(result["final_report"], encoding="utf-8")

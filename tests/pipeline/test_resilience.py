@@ -31,11 +31,12 @@ def test_unknown_report_reference_is_not_in_the_bibliography(monkeypatch, comple
     class BadReferenceModel(Model):
         def structured(self, schema, messages):
             return schema(**{field: report.Paragraph(text="확보된 자료의 해석", reference_ids=["invented-id"])
-                             for field in schema.model_fields})
+                             for field in schema.model_fields if field != "criterion_rationales"},
+                          criterion_rationales=[])
     monkeypatch.setattr(report, "init_chat_model", lambda *args, **kwargs: BadReferenceModel())
     result = report.report_generation_agent(completed_state)
     assert "invented-id" not in result["final_report"]
-    assert "[^market-" in result["final_report"]
+    assert "[^1]:" in result["final_report"]
 
 
 def test_report_failure_preserves_the_actual_input(monkeypatch, completed_state):
@@ -51,12 +52,14 @@ def test_all_failed_nodes_still_reach_a_fallback_report():
     failure = Mock(side_effect=ValueError("failed"))
     failure.__name__ = "failed_node"
     names = ("technical_research_agent", "trl_evaluation_node", "market_evaluation_agent",
-             "stakeholder_evaluation_agent", "domain_evaluation_agent", "evaluation_synthesis_agent", "report_generation_agent")
+             "stakeholder_evaluation_agent", "domain_evaluation_agent", "evaluation_synthesis_agent",
+             "report_generation_agent", "report_quality_agent")
     with ExitStack() as stack:
         for name in names:
             stack.enter_context(patch.object(app, name, failure))
         state = app.build_graph().invoke({"references": []})
-    assert len(state["run_errors"]) == 7
+    assert len(state["run_errors"]) == 8
+    assert state["report_quality"] == {}
     assert "부분 결과" in state["final_report"]
 
 

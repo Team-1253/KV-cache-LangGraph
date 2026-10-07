@@ -10,6 +10,7 @@ import app
 from agents import technical_research as technical, domain_evaluation as domain
 from agents import market_evaluation as market, stakeholder_evaluation as stakeholder
 from agents import evaluation_synthesis as synthesis, report_generation as report
+from agents import report_quality as quality
 from agents.state import PerspectiveResult, Criterion, Reference, evaluation_material
 
 
@@ -70,7 +71,14 @@ class Model:
         if schema is report.ReportNarrative:
             material = json.loads(request)
             ids = [ref["id"] for ref in material["references"]]
-            return schema(**{field: report.Paragraph(text="근거에 따른 해석", reference_ids=ids[:1]) for field in schema.model_fields})
+            return schema(
+                **{field: report.Paragraph(text="근거에 따른 해석", reference_ids=ids[:1])
+                   for field in schema.model_fields if field != "criterion_rationales"},
+                criterion_rationales=[],
+            )
+        if schema is quality.ReportQuality:
+            return schema(groundedness=True, neutrality=True, bias_control=True,
+                          perspective_coverage=True, feedback="")
         raise AssertionError(schema)
 
     def invoke(self, messages):
@@ -82,7 +90,7 @@ class Model:
 def offline_models(monkeypatch):
     model = Model()
     model.calls = []
-    for module in (technical, domain, market, stakeholder, synthesis, report):
+    for module in (technical, domain, market, stakeholder, synthesis, report, quality):
         monkeypatch.setattr(module, "init_chat_model", lambda *args, **kwargs: model)
     for module in (technical, domain):
         monkeypatch.setattr(module, "TechRetriever", Retriever)
@@ -121,10 +129,11 @@ def test_all_perspectives_have_the_same_fields_and_real_references(completed_sta
 
 def test_report_connects_each_perspective_and_preserves_values(completed_state):
     text = completed_state["final_report"]
-    for perspective in ("technical", "market", "stakeholder", "domain"):
-        assert f"[^{perspective}-" in text.split("## REFERENCE")[0]
+    for perspective in ("기술 성숙도", "시장성", "이해관계자", "도메인 적용성"):
+        assert f"— {perspective}" in text.split("## REFERENCE")[0]
+    assert "[^1]" in text.split("## REFERENCE")[0]
     assert "80.0 (0-100)" in text
-    assert "coverage: **100%**" in text
+    assert "근거 확보율: **100%**" in text
     assert "DeepSeek 67B" in text and "model comparison" in text
     assert "## 6. 한계점" in text and "## REFERENCE" in text
     material = evaluation_material(completed_state)
@@ -141,10 +150,14 @@ def test_every_model_receives_its_markdown_prompt(completed_state, offline_model
         stakeholder.TechnologyAssessment: stakeholder.PROMPT_PATH.read_text(),
         domain.DomainAssessment: domain.PROMPT_PATH.read_text(),
         report.ReportNarrative: report.PROMPT_PATH.read_text(), None: synthesis.PROMPT_PATH.read_text(),
+        quality.ReportQuality: quality.PROMPT_PATH.read_text(),
     }
     seen = set()
     for schema, messages in offline_models.calls:
-        assert messages[0].content == expected[schema]
+        if schema is report.ReportNarrative:
+            assert messages[0].content.startswith(expected[schema])
+        else:
+            assert messages[0].content == expected[schema]
         seen.add(schema)
     assert seen == set(expected)
 
